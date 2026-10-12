@@ -3,12 +3,12 @@
   "id": "mailru",
   "channels": {
     "stable": {
-      "version": "1.1.1",
+      "version": "1.1.2",
       "wire": 1,
       "api": 1,
-      "url": "https://github.com/p1neappleXpress/OpenFluxTransports/releases/download/mailru-v1.1.1/mailru-1.1.1.flux",
-      "sha256": "0a2c447a3b2a164fcd317824cff500c242d1194b134070e49661906c1cfe8b15",
-      "notes": "mailru 1.1.1: a link without edit rights no longer drops the connection every few seconds (saveChanges is not sent where editing is forbidden), and the editor auth waits for the Engine.IO / Socket.IO handshake. Same two changes as OpenFlux core 0.4.2."
+      "url": "https://github.com/p1neappleXpress/OpenFluxTransports/releases/download/mailru-v1.1.2/mailru-1.1.2.flux",
+      "sha256": "faa3774ea691fa37c5991b798bc969e9391c653765def3ebc47911abe77c8563",
+      "notes": "mailru 1.1.2: User-Agent Firefox/155 + Accept-Language на WebSocket — Mail.ru больше не отклоняет рукопожатие кодом HTTP 409. Подключение восстановлено."
     }
   }
 }
