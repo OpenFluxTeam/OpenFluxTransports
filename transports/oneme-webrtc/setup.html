@@ -603,15 +603,16 @@ function renderSummary() {
 }
 
 // What each side keeps. The client side: its account's token, who it calls (the node's user id) and
-// the chat the offer goes through. The node side: its account's token. (The app tells the node it is
-// the node; it does not need the others.)
+// the chat the offer goes through. The node side: its account's token and its own user id (a second
+// device that only signs its own account in learns whom to call from it). The core tells a node it is
+// the node, so no exit flag.
 function payload() {
   var client = {
     token: state.client.token,
     uid: String(CLIENT_ONLY ? INIT.nodeUid : state.node.uid),
     chatId: String(state.chatId)
   };
-  return CLIENT_ONLY ? { client: client } : { client: client, node: { token: state.node.token } };
+  return CLIENT_ONLY ? { client: client } : { client: client, node: { token: state.node.token, uid: String(state.node.uid) } };
 }
 
 $("submitBtn").onclick = function() {

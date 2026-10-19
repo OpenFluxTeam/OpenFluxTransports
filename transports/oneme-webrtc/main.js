@@ -544,17 +544,19 @@ var Transport = {
   info: function () {
     return {
       name: "oneme-webrtc",
-      version: "3.3.0",
+      version: "3.3.1",
       // What a setup page hands over lands in the cookie jar of this address (cookiesApplied).
       cookieDomain: "https://web.max.ru/",
       mtu: 0,
       reliable: false,
       ordered: false,
+      // All of them are settings, none is the profile's one input: a profile's value field would otherwise be
+      // taken for the token, and wiped when the wizard filled the setting instead. Which end this is the core
+      // says itself (cfg.params.exit), so it is no setting.
       params: [
-        { key: "token", label: "MAX web token", type: "secret", required: true },
-        { key: "uid", label: "Callee userId", type: "text", required: false },
-        { key: "chatId", label: "Chat ID for signaling", type: "text", required: false },
-        { key: "exit", label: "Receiver role (true/false)", type: "text", required: false },
+        { key: "token", label: "MAX web token", type: "secret", required: true, scope: "settings" },
+        { key: "uid", label: "Callee userId", type: "text", required: false, scope: "settings" },
+        { key: "chatId", label: "Chat ID for signaling", type: "text", required: false, scope: "settings" },
       ],
     };
   },
