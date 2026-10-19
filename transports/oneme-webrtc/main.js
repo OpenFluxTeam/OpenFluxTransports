@@ -93,10 +93,21 @@ function decodeSDP(emojiText) {
 
 // ── Setup wizard backend ──
 
-function startWizard() {
-  var srv = httpserver.listen(function (req) {
+var wizardServer = null;
+
+// startWizard serves the setup page and asks the app to show it. values are what is known: with the
+// node's user id (values.uid) the wizard only signs this side in (a second client of an existing
+// node); without, it signs both accounts in and hands back {client, node}.
+function startWizard(values) {
+  if (wizardServer) return;
+  var init = { nodeUid: String((values && values.uid) || "") };
+  var page = SETUP_HTML.replace(
+    '<script id="init" type="application/json">{}</script>',
+    '<script id="init" type="application/json">' + JSON.stringify(init).replace(/</g, "\\u003c") + "</script>"
+  );
+  wizardServer = httpserver.listen(function (req) {
     if (req.path === "/" || req.path === "") {
-      return { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" }, body: SETUP_HTML };
+      return { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" }, body: page };
     }
     if (req.path === "/api/verify" && req.method === "POST") {
       return verifyToken(req);
@@ -108,8 +119,8 @@ function startWizard() {
   });
 
   raise("needsSetup", {
-    url: "http://" + srv.addr + "/",
-    reason: "Подключение через MAX",
+    url: "http://" + wizardServer.addr + "/",
+    reason: init.nodeUid ? "Вход в MAX" : "Подключение через MAX",
   });
 }
 
@@ -179,6 +190,26 @@ function dialogCandidates(chats, clientUid, nodeUid) {
   return out;
 }
 
+// acceptedChat is the chat check without the other account's token (a second client of an existing
+// node): the first chat id the server takes a message for. Whether it arrives cannot be seen from here.
+function acceptedChat(c, cands) {
+  var tried = [];
+  function attempt(i) {
+    if (i >= cands.length) {
+      return Promise.resolve({ ok: false, error: "MAX не принял сообщение ни в один чат (" + tried.join("; ") + ")" });
+    }
+    var cid = Math.floor(Math.random() * 9007199254740991) + 1;
+    return c.invoke(64, { chatId: cands[i], message: { text: "ofx_" + Date.now(), cid: cid } }).then(function (r) {
+      if ((r || {}).cmd === 3) {
+        tried.push(cands[i] + ": " + (((r.payload || {}).message) || ((r.payload || {}).error) || "ошибка"));
+        return attempt(i + 1);
+      }
+      return { ok: true, chatId: (r.payload || {}).chatId || cands[i], unconfirmed: true };
+    });
+  }
+  return attempt(0);
+}
+
 function verifyChat(req) {
   var body;
   try { body = JSON.parse(text.decode(req.body)); } catch (e) {
@@ -200,6 +231,7 @@ function verifyChat(req) {
     return maxclient.loginByToken(cA, clientTok);
   }).then(function (respA) {
     var cands = dialogCandidates((respA.payload || {}).chats || [], clientUid, nodeUid);
+    if (!nodeTok) return acceptedChat(cA, cands);
     return maxclient.connect().then(function (b) {
       cB = b;
       return maxclient.loginByToken(cB, nodeTok);
@@ -470,11 +502,51 @@ function onCallerEvent(packet) {
 
 // ── Transport interface ──
 
+// readParams takes the settings the carrier was given (the core adds exit itself: it is the node).
+function readParams(p) {
+  maxToken = p.token || "";
+  calleeID = parseInt(p.uid, 10) || 0;
+  chatID = parseInt(p.chatId, 10) || 0;
+  role = (p.exit === true || p.exit === "true") ? "receiver" : "caller";
+}
+
+// begin signs in with the token and runs the role: the node waits for the call, the client makes it.
+function begin() {
+  maxclient.connect().then(function (c) {
+    client = c;
+    return maxclient.loginByToken(client, maxToken);
+  }).then(function () {
+    maxclient.startKeepalive(client);
+    if (role === "receiver") {
+      client.setOnEvent(onIncomingCallEvent);
+    } else {
+      client.setOnEvent(onCallerEvent);
+      connectCallerLoop();
+    }
+  }).catch(function (e) {
+    setState("dead", String(e));
+  });
+}
+
+// stopCall drops what a running call holds, for a restart with other settings.
+function stopCall() {
+  if (pc) { try { pc.close(); } catch (e) {} }
+  if (callConn) { try { callConn.close(); } catch (e) {} }
+  if (client && client.sock) { try { client.sock.close(); } catch (e) {} }
+  pc = null;
+  callConn = null;
+  client = null;
+}
+
+var tokenFromParams = false;
+
 var Transport = {
   info: function () {
     return {
       name: "oneme-webrtc",
-      version: "3.2.2",
+      version: "3.3.0",
+      // What a setup page hands over lands in the cookie jar of this address (cookiesApplied).
+      cookieDomain: "https://web.max.ru/",
       mtu: 0,
       reliable: false,
       ordered: false,
@@ -487,33 +559,41 @@ var Transport = {
     };
   },
 
+  // setup is the wizard an app runs while a node is being made (before anything connects): it
+  // signs the accounts in and hands back {client: {...}, node: {...}} through openfluxSubmit.
+  setup: function (values) {
+    startWizard(values || {});
+  },
+
   open: function (cfg) {
-    var p = (cfg && cfg.params) || {};
-    maxToken = p.token || "";
-    calleeID = parseInt(p.uid, 10) || 0;
-    chatID = parseInt(p.chatId, 10) || 0;
-    role = (p.exit === true || p.exit === "true") ? "receiver" : "caller";
+    readParams((cfg && cfg.params) || {});
+    tokenFromParams = !!maxToken;
     running = true;
 
     if (!maxToken) {
-      startWizard();
+      if (role === "receiver") {
+        // A node has no one to sign in for it: it needs the token its setup gave it.
+        setState("dead", "у ноды нет токена аккаунта MAX: настройте ноду заново");
+        return;
+      }
+      // Nothing saved yet: ask for the account (or both), the answer comes back as cookiesApplied.
+      startWizard({ uid: calleeID ? String(calleeID) : "" });
       return;
     }
+    begin();
+  },
 
-    maxclient.connect().then(function (c) {
-      client = c;
-      return maxclient.loginByToken(client, maxToken);
-    }).then(function () {
-      maxclient.startKeepalive(client);
-      if (role === "receiver") {
-        client.setOnEvent(onIncomingCallEvent);
-      } else {
-        client.setOnEvent(onCallerEvent);
-        connectCallerLoop();
-      }
-    }).catch(function (e) {
-      setState("dead", String(e));
-    });
+  // cookiesApplied: the setup page's answer for this side (token, uid, chatId), or what the app
+  // saved from an earlier one. Settings the carrier was given outrank it.
+  onEvent: function (kind) {
+    if (kind !== "cookiesApplied" || !running || tokenFromParams) return;
+    var c = cookieJar.get();
+    if (!c.token || c.token === maxToken) return;
+    stopCall();
+    maxToken = c.token;
+    calleeID = parseInt(c.uid, 10) || calleeID;
+    chatID = parseInt(c.chatId, 10) || chatID;
+    begin();
   },
 
   write: function (bytes) {
@@ -522,9 +602,8 @@ var Transport = {
 
   close: function () {
     running = false;
-    if (pc) { try { pc.close(); } catch (e) {} }
-    if (callConn) { try { callConn.close(); } catch (e) {} }
-    if (client && client.sock) { try { client.sock.close(); } catch (e) {} }
+    if (wizardServer) { try { wizardServer.close(); } catch (e) {} wizardServer = null; }
+    stopCall();
   },
 
 };

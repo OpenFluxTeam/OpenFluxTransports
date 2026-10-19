@@ -333,7 +333,7 @@ textarea { resize: vertical; min-height: 60px; font-family: monospace; font-size
       <div id="chatInfo"></div>
     </div>
     <div class="actions">
-      <button class="btn btn-secondary" onclick="goStep(2)">Назад</button>
+      <button class="btn btn-secondary" onclick="goStep(CLIENT_ONLY ? 1 : 2)">Назад</button>
       <button class="btn btn-primary" id="verifyChat">Проверить чат</button>
     </div>
   </div>
@@ -347,12 +347,19 @@ textarea { resize: vertical; min-height: 60px; font-family: monospace; font-size
     </div>
     <div class="actions">
       <button class="btn btn-secondary" onclick="goStep(3)">Назад</button>
-      <button class="btn btn-ok" id="submitBtn">Подключить</button>
+      <button class="btn btn-ok" id="submitBtn">Готово</button>
     </div>
   </div>
 </div>
 
+<script id="init" type="application/json">{}</script>
 <script>
+// The script fills in the init block: with the node's user id this is a second client of an
+// existing node, which signs only its own account in.
+var INIT = {};
+try { INIT = JSON.parse(document.getElementById("init").textContent || "{}"); } catch (e) {}
+var CLIENT_ONLY = !!INIT.nodeUid;
+
 var state = {
   step: 1,
   client: { token: "", uid: 0, name: "", phone: "" },
@@ -365,7 +372,8 @@ function $(id) { return document.getElementById(id); }
 function goStep(n) {
   state.step = n;
   for (var i = 1; i <= 4; i++) {
-    $("step" + i).classList.toggle("visible", i === n);
+    var el = $("step" + i); // a second client has no step 2
+    if (el) el.classList.toggle("visible", i === n);
   }
   var dots = document.querySelectorAll(".steps .dot");
   for (var j = 0; j < dots.length; j++) {
@@ -482,7 +490,7 @@ $("loginClient").onclick = function() { startWebViewAuth("client"); };
 $("loginNode").onclick = function() { startWebViewAuth("node"); };
 
 // ── Next buttons ──
-$("step1Next").onclick = function() { if (state.client.token) goStep(2); };
+$("step1Next").onclick = function() { if (state.client.token) goStep(CLIENT_ONLY ? 3 : 2); };
 $("step2Next").onclick = function() { if (state.node.token) goStep(3); };
 
 // ── Manual toggle ──
@@ -551,9 +559,9 @@ $("verifyChat").onclick = function() {
   $("chatInfo").innerHTML = "";
   api("chat", {
     clientToken: state.client.token,
-    nodeToken: state.node.token,
+    nodeToken: CLIENT_ONLY ? "" : state.node.token,
     clientUid: state.client.uid,
-    nodeUid: state.node.uid
+    nodeUid: CLIENT_ONLY ? INIT.nodeUid : state.node.uid
   }).then(function(r) {
     if (r.ok) {
       state.chatId = r.chatId;
@@ -561,7 +569,7 @@ $("verifyChat").onclick = function() {
       $("chatInfo").innerHTML =
         '<div class="profile" style="margin-top:12px">' +
         '<div><div class="name">chatId: ' + r.chatId + '</div>' +
-        '<div class="phone">Тестовое сообщение доставлено</div></div></div>';
+        '<div class="phone">' + (r.unconfirmed ? "Сообщение принято сервером" : "Тестовое сообщение доставлено") + '</div></div></div>';
       setTimeout(function() { goStep(4); }, 600);
     } else {
       $("chatStatus").innerHTML = badge("err", r.error || "Не удалось установить связь");
@@ -576,12 +584,16 @@ $("verifyChat").onclick = function() {
 // ── Summary + Submit ──
 function renderSummary() {
   var rows = [
-    ["Клиент", state.client.name + " (" + state.client.phone + ")"],
-    ["uid клиента", String(state.client.uid)],
-    ["Нода", state.node.name + " (" + state.node.phone + ")"],
-    ["uid ноды", String(state.node.uid)],
-    ["chatId", String(state.chatId)],
+    ["Ваш аккаунт", state.client.name + " (" + state.client.phone + ")"],
+    ["uid вашего аккаунта", String(state.client.uid)]
   ];
+  if (CLIENT_ONLY) {
+    rows.push(["uid ноды", String(INIT.nodeUid)]);
+  } else {
+    rows.push(["Аккаунт ноды", state.node.name + " (" + state.node.phone + ")"]);
+    rows.push(["uid ноды", String(state.node.uid)]);
+  }
+  rows.push(["chatId", String(state.chatId)]);
   var html = "";
   for (var i = 0; i < rows.length; i++) {
     html += '<div class="summary-row"><span class="key">' + rows[i][0] +
@@ -590,27 +602,37 @@ function renderSummary() {
   $("summary").innerHTML = html;
 }
 
-$("submitBtn").onclick = function() {
-  var payload = {
-    client: {
-      token: state.client.token,
-      uid: String(state.node.uid),
-      chatId: String(state.chatId)
-    },
-    node: {
-      token: state.node.token,
-      exit: "true"
-    }
+// What each side keeps. The client side: its account's token, who it calls (the node's user id) and
+// the chat the offer goes through. The node side: its account's token. (The app tells the node it is
+// the node; it does not need the others.)
+function payload() {
+  var client = {
+    token: state.client.token,
+    uid: String(CLIENT_ONLY ? INIT.nodeUid : state.node.uid),
+    chatId: String(state.chatId)
   };
+  return CLIENT_ONLY ? { client: client } : { client: client, node: { token: state.node.token } };
+}
+
+$("submitBtn").onclick = function() {
+  var data = payload();
   if (window.openfluxSubmit) {
-    window.openfluxSubmit(payload);
+    window.openfluxSubmit(data);
   } else {
     $("summary").innerHTML += '<div class="hint-box" style="margin-top:12px">' +
       '<code>openfluxSubmit</code> не найден — открыто вне приложения.<br>' +
-      'Payload: <pre style="white-space:pre-wrap;font-size:11px;margin-top:4px">' +
-      esc(JSON.stringify(payload, null, 2)) + '</pre></div>';
+      'Данные: <pre style="white-space:pre-wrap;font-size:11px;margin-top:4px">' +
+      esc(JSON.stringify(data, null, 2).replace(/"token": "[^"]*"/g, '"token": "…"')) + '</pre></div>';
   }
 };
+
+// ── Client-only mode: no node account to sign in ──
+if (CLIENT_ONLY) {
+  $("step2").remove();
+  $("step1").querySelector(".desc").textContent = "Войдите в свой аккаунт MAX: нода уже настроена, нужен только он.";
+  var dot = document.querySelectorAll(".steps .dot")[1];
+  if (dot) dot.style.display = "none";
+}
 </script>
 </body>
 </html>
