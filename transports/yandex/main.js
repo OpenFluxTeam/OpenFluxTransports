@@ -286,15 +286,38 @@ SentinelError.prototype = Object.create(Error.prototype);
 
 // ---- keepalive / message handling / write (identical shape to mailru.js) ----
 
+// buildDataSaveChanges wraps a base64-encoded payload into a saveChanges
+// message. Yandex Disk relays saveChanges between participants but drops
+// standalone cursor messages.
+var dataSaveSeq = 0;
+function buildDataSaveChanges(b64payload) {
+  var uid = (docInfo && docInfo.editorUserId) || userID || "";
+  var short = uid.length > 10 ? uid.slice(0, 10) : uid;
+  var excel = docInfo ? docInfo.isExcel : false;
+  var seq = ++dataSaveSeq;
+  var changes = [MODEL_META_OP, cursorOp(short, seq), cursorOp(short, seq + 1), cursorOp(short, seq + 2)];
+  var msg = {
+    changes: JSON.stringify(changes),
+    deleteIndex: null,
+    endSaveChanges: true,
+    excelAdditionalInfo: b64payload,
+    isCoAuthoring: true,
+    isExcel: !!excel,
+    releaseLocks: true,
+    startSaveChanges: true,
+    type: "saveChanges",
+    unlock: false,
+  };
+  return "42" + JSON.stringify(["message", msg]);
+}
+
 function startKeepAlive() {
   if (keepAliveTimer) clearInterval(keepAliveTimer);
   keepAliveTimer = setInterval(function () {
     if (!sock) return;
     try {
-      sock.send('42["message",{"type":"cursor","cursor":"18;---KA---"}]');
+      sock.send(buildDataSaveChanges("---KA---"));
     } catch (e) {
-      // Same as the native keep-alive: a write that fails means a dead
-      // connection - close it so the reconnect (via onclose) happens.
       setState("reconnecting", String(e));
       try { sock.close(); } catch (e2) {}
     }
@@ -455,7 +478,7 @@ var Transport = {
 
   write: function (bytes) {
     if (!sock) throw new Error("yandex: not connected");
-    sock.send('42["message",{"type":"cursor","cursor":"18;' + base64.encode(bytes) + '"}]');
+    sock.send(buildDataSaveChanges(base64.encode(bytes)));
   },
 
   close: function () {
