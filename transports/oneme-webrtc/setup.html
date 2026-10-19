@@ -384,7 +384,8 @@ function profileHTML(data) {
     '<div class="avatar">' + initial + '</div>' +
     '<div><div class="name">' + esc(data.name) + '</div>' +
     '<div class="phone">' + esc(data.phone) + '</div>' +
-    '<div class="uid">uid ' + data.uid + '</div></div></div>';
+    '<div class="uid">uid ' + data.uid + '</div></div></div>' +
+    (data.uid ? '' : '<div class="hint-box" style="margin-top:8px;font-size:11px">Ответ MAX без профиля: ' + esc(data.shape || "?") + '</div>');
 }
 
 function esc(s) {
@@ -438,7 +439,7 @@ function startWebViewAuth(role) {
     try { auth = JSON.parse(stored); } catch (e) {}
     if (!auth || !auth.token) throw new Error("MAX не вернул токен входа");
     statusEl.innerHTML = badge("wait", '<span class="spinner"></span> Проверяю токен...');
-    return api("verify", { token: auth.token }).then(function(r) {
+    return api("verify", { token: auth.token, viewerId: auth.viewerId }).then(function(r) {
       if (r.ok) r.token = auth.token;
       handleAuthResult(role, r);
     });

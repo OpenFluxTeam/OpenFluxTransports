@@ -113,37 +113,70 @@ function startWizard() {
   });
 }
 
+function jsonResponse(obj) {
+  return { status: 200, headers: { "Content-Type": "application/json" }, body: JSON.stringify(obj) };
+}
+
+// accountOf reads who a LOGIN reply is about. The web client takes payload.profile.contact
+// (id, phone, names[0].firstName / lastName); hintUid is the id the sign-in window saw.
+function accountOf(payload, hintUid) {
+  var p = payload || {};
+  var profile = p.profile || {};
+  var contact = profile.contact || p.contact || {};
+  var n0 = (contact.names && contact.names[0]) || {};
+  var name = ((n0.firstName || contact.firstName || n0.name || "") + " " + (n0.lastName || contact.lastName || "")).trim();
+  var phone = contact.phone ? String(contact.phone) : "";
+  if (phone && phone.charAt(0) !== "+") phone = "+" + phone;
+  return {
+    uid: contact.id || profile.id || hintUid || 0,
+    name: name,
+    phone: phone,
+    // Key names only, no values: what to look at when a field comes back empty.
+    shape: Object.keys(p).join(",") + " | profile: " + Object.keys(profile).join(",") + " | contact: " + Object.keys(contact).join(","),
+  };
+}
+
 function verifyToken(req) {
   var body;
   try { body = JSON.parse(text.decode(req.body)); } catch (e) {
     return { status: 400, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ok: false, error: "bad json" }) };
   }
   var token = body.token || "";
-  if (!token) {
-    return { status: 200, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ok: false, error: "пустой токен" }) };
-  }
+  if (!token) return jsonResponse({ ok: false, error: "пустой токен" });
 
   return maxclient.connect().then(function (c) {
     return maxclient.loginByToken(c, token).then(function (resp) {
-      var p = resp.payload || {};
-      var contact = p.contact || {};
-      var name = (contact.firstName || "") + " " + (contact.lastName || "");
-      var phone = contact.phone || "";
-      var uid = contact.id || 0;
+      var a = accountOf(resp.payload, parseInt(body.viewerId, 10) || 0);
       try { c.sock.close(); } catch (e) {}
-      return {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ok: true, uid: uid, name: name.trim(), phone: phone }),
-      };
+      return jsonResponse({ ok: true, uid: a.uid, name: a.name, phone: a.phone, shape: a.shape });
     });
   }).catch(function (e) {
-    return {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ok: false, error: String(e) }),
-    };
+    return jsonResponse({ ok: false, error: String(e) });
   });
+}
+
+// xorIds: a private chat's id is the two user ids XORed. The 32-bit ^ would cut the high bits off.
+function xorIds(a, b) {
+  var M = 4294967296;
+  var hi = (Math.floor(a / M) ^ Math.floor(b / M)) >>> 0;
+  var lo = ((a % M) ^ (b % M)) >>> 0;
+  return hi * M + lo;
+}
+
+// dialogCandidates lists the chat ids a message to nodeUid may go to, best first: a dialog the
+// LOGIN reply already lists with that user in it, the XOR id, the bare user id.
+function dialogCandidates(chats, clientUid, nodeUid) {
+  var out = [];
+  function add(id) { if (id && out.indexOf(id) === -1) out.push(id); }
+  for (var i = 0; i < chats.length; i++) {
+    var c = chats[i] || {};
+    var parts = c.participants || {};
+    var ids = c.memberIds || [];
+    if (c.type === "DIALOG" && (parts[nodeUid] !== undefined || ids.indexOf(nodeUid) !== -1)) add(c.id);
+  }
+  if (clientUid && nodeUid) add(xorIds(clientUid, nodeUid));
+  add(nodeUid);
+  return out;
 }
 
 function verifyChat(req) {
@@ -154,77 +187,65 @@ function verifyChat(req) {
 
   var clientTok = body.clientToken;
   var nodeTok = body.nodeToken;
-  var clientUid = body.clientUid;
-  var nodeUid = body.nodeUid;
+  var clientUid = parseInt(body.clientUid, 10) || 0;
+  var nodeUid = parseInt(body.nodeUid, 10) || 0;
+  var cA = null, cB = null;
+  function closeBoth() {
+    try { if (cA) cA.sock.close(); } catch (e) {}
+    try { if (cB) cB.sock.close(); } catch (e) {}
+  }
 
-  return maxclient.connect().then(function (cA) {
-    return maxclient.loginByToken(cA, clientTok).then(function (respA) {
-      var chats = (respA.payload || {}).chats || [];
-      var chatId = 0;
-      for (var i = 0; i < chats.length; i++) {
-        var members = chats[i].memberIds || [];
-        if (members.indexOf(nodeUid) !== -1) {
-          chatId = chats[i].id;
-          break;
+  return maxclient.connect().then(function (a) {
+    cA = a;
+    return maxclient.loginByToken(cA, clientTok);
+  }).then(function (respA) {
+    var cands = dialogCandidates((respA.payload || {}).chats || [], clientUid, nodeUid);
+    return maxclient.connect().then(function (b) {
+      cB = b;
+      return maxclient.loginByToken(cB, nodeTok);
+    }).then(function () {
+      var msgRx = false;
+      var testText = "ofx_" + Date.now();
+      cB.setOnEvent(function (pkt) {
+        if (pkt.opcode === 128) {
+          var msg = (pkt.payload || {}).message || {};
+          if (msg.text === testText) msgRx = true;
         }
-      }
-      if (!chatId) {
-        for (var j = 0; j < chats.length; j++) {
-          if (chats[j].id === nodeUid) { chatId = nodeUid; break; }
-        }
-      }
-      if (!chatId) chatId = nodeUid;
+      });
 
-      return maxclient.connect().then(function (cB) {
-        return maxclient.loginByToken(cB, nodeTok).then(function () {
-          var msgRx = false;
-          var testText = "ofx_" + Date.now();
-          cB.setOnEvent(function (pkt) {
-            if (pkt.opcode === 128) {
-              var msg = (pkt.payload || {}).message || {};
-              if (msg.text === testText) msgRx = true;
-            }
-          });
-          var cid = Math.floor(Math.random() * 9007199254740991) + 1;
-          return cA.invoke(64, { chatId: chatId, message: { text: testText, cid: cid } }).then(function (r) {
-            if ((r || {}).cmd === 3) {
-              try { cA.sock.close(); } catch (e) {}
-              try { cB.sock.close(); } catch (e) {}
-              return {
-                status: 200,
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ ok: false, error: "MSG_SEND failed: " + JSON.stringify((r.payload || {}).error) }),
-              };
-            }
-            var serverChatId = (r.payload || {}).chatId || chatId;
-            return new Promise(function (resolve) {
-              var checks = 0;
-              var timer = setInterval(function () {
-                checks++;
-                if (msgRx || checks > 20) {
-                  clearInterval(timer);
-                  try { cA.sock.close(); } catch (e) {}
-                  try { cB.sock.close(); } catch (e) {}
-                  resolve({
-                    status: 200,
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(msgRx
-                      ? { ok: true, chatId: serverChatId }
-                      : { ok: false, error: "сообщение не доставлено за 10 секунд" }),
-                  });
-                }
-              }, 500);
-            });
+      // The first id the server takes a message for is the chat.
+      var tried = [];
+      function attempt(i) {
+        if (i >= cands.length) {
+          return Promise.resolve({ ok: false, error: "MSG_SEND не принят ни для одного чата (" + tried.join("; ") + ")" });
+        }
+        var cid = Math.floor(Math.random() * 9007199254740991) + 1;
+        return cA.invoke(64, { chatId: cands[i], message: { text: testText, cid: cid } }).then(function (r) {
+          if ((r || {}).cmd === 3) {
+            tried.push(cands[i] + ": " + (((r.payload || {}).message) || ((r.payload || {}).error) || "ошибка"));
+            return attempt(i + 1);
+          }
+          var serverChatId = (r.payload || {}).chatId || cands[i];
+          return new Promise(function (resolve) {
+            var checks = 0;
+            var timer = setInterval(function () {
+              checks++;
+              if (msgRx || checks > 20) {
+                clearInterval(timer);
+                resolve(msgRx ? { ok: true, chatId: serverChatId } : { ok: false, error: "сообщение не доставлено за 10 секунд" });
+              }
+            }, 500);
           });
         });
-      });
+      }
+      return attempt(0);
     });
+  }).then(function (res) {
+    closeBoth();
+    return jsonResponse(res);
   }).catch(function (e) {
-    return {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ok: false, error: String(e) }),
-    };
+    closeBoth();
+    return jsonResponse({ ok: false, error: String(e) });
   });
 }
 
@@ -453,7 +474,7 @@ var Transport = {
   info: function () {
     return {
       name: "oneme-webrtc",
-      version: "3.2.1",
+      version: "3.2.2",
       mtu: 0,
       reliable: false,
       ordered: false,
