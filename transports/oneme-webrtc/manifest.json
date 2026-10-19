@@ -1,7 +1,7 @@
 {
   "id": "oneme-webrtc",
   "name": "oneme-webrtc",
-  "version": "3.3.1",
+  "version": "3.3.2",
   "author": "OpenFlux",
   "description": "MAX (OneMe): P2P DataChannel via TURN relay, emoji-encrypted MSG_SEND signaling.",
   "wire": 1,

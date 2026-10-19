@@ -544,7 +544,7 @@ var Transport = {
   info: function () {
     return {
       name: "oneme-webrtc",
-      version: "3.3.1",
+      version: "3.3.2",
       // What a setup page hands over lands in the cookie jar of this address (cookiesApplied).
       cookieDomain: "https://web.max.ru/",
       mtu: 0,
