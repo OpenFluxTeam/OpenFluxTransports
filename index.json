@@ -72,6 +72,12 @@
       "name": "vkteams",
       "description": "VK Teams Calls: packets ride a WebRTC data channel in a VK Teams call room (guest join, no sign-in).",
       "update": "https://raw.githubusercontent.com/OpenFluxTeam/OpenFluxTransports/updates/vkteams/update.json"
+    },
+    {
+      "id": "telemost",
+      "name": "telemost",
+      "description": "Yandex Telemost: packets ride a conference as a participant's screen-share video stream.",
+      "update": "https://raw.githubusercontent.com/OpenFluxTeam/OpenFluxTransports/updates/telemost/update.json"
     }
   ]
 }

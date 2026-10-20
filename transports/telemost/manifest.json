@@ -1,0 +1,12 @@
+{
+  "id": "telemost",
+  "name": "telemost",
+  "version": "1.0.0",
+  "author": "OpenFlux",
+  "description": "Yandex Telemost: packets ride a conference as a participant's screen-share video stream.",
+  "wire": 1,
+  "api": 1,
+  "update": [
+    "https://raw.githubusercontent.com/OpenFluxTeam/OpenFluxTransports/updates/telemost/update.json"
+  ]
+}
