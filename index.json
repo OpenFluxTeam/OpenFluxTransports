@@ -66,6 +66,12 @@
       "name": "pruffme",
       "description": "PRUFFME: packets ride cursor position updates on a shared whiteboard.",
       "update": "https://raw.githubusercontent.com/p1neappleXpress/OpenFluxTransports/updates/pruffme/update.json"
+    },
+    {
+      "id": "vkteams",
+      "name": "vkteams",
+      "description": "VK Teams Calls: packets ride a WebRTC data channel in a VK Teams call room (guest join, no sign-in).",
+      "update": "https://raw.githubusercontent.com/OpenFluxTeam/OpenFluxTransports/updates/vkteams/update.json"
     }
   ]
 }

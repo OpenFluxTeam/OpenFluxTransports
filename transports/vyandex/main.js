@@ -21,6 +21,7 @@
 // httpMaxConnsPerHost/httpMaxIdleConns, not by counting workers in JS.
 
 var captcha = require("../../lib/captcha.js");
+var yandexauth = require("../../lib/yandexauth.js");
 
 var UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0";
 var CLIENT_CONFIG_RE = /<script[^>]*id="client-config"[^>]*>(.*?)<\/script>/;
@@ -538,8 +539,9 @@ var Transport = {
   info: function () {
     return {
       name: "vyandex",
-      version: "1.1.0",
+      version: "1.2.0",
       cookieDomain: "https://yandex.ru/",
+      auth: yandexauth.auth("always"),
       scopeCookiesToParentDomain: true,
       mtu: 0,
       reliable: false,

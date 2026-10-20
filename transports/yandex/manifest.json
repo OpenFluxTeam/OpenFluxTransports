@@ -1,7 +1,7 @@
 {
   "id": "yandex",
   "name": "yandex",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "OpenFlux",
   "description": "Yandex Docs: packets ride the cursor field of a document's co-editing session.",
   "wire": 1,
