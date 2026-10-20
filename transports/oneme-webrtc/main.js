@@ -34,6 +34,23 @@ var OFFER_RESEND_MS = [7000, 16000];// the offer again, when no answer has come
 var DISCONNECT_GRACE_MS = 8000;     // "disconnected" that long = lost
 var STALE = { stale: true };        // thrown to leave a promise chain whose call/session is over
 
+// ── The data channel's datagrams ──
+//
+// A message of the data channel is one datagram on the wire only if it fits one SCTP chunk. A longer one
+// is cut into several datagrams sent back to back, and the relay in front of a mobile network keeps the
+// first of such a burst and drops most of the rest: the whole message is lost with any one of them.
+// So what the tunnel hands to write() is sized to one chunk.
+//   SCTP_MTU      the SCTP packet; plus 69 bytes of DTLS, TURN, UDP and IP it is the datagram, 1429 here,
+//                 which the phone's mobile network (1430) moves without fragmenting
+//   a chunk       holds SCTP_MTU - 32 (the common header and an I-DATA header)
+//   CARRIER_MTU   the IP packet the tunnel runs over this channel; the tunnel puts 115 bytes around it
+//                 (78 envelope, 4 batch framing, 33 encryption): 1200 + 115 = 1315 <= 1328
+//   BATCH_BYTES   how much the tunnel may coalesce into one message: a chunk less the 35 bytes of
+//                 encryption and batch header, and a packet that does not fit starts the next message
+var SCTP_MTU = 1360;
+var CARRIER_MTU = 1200;
+var BATCH_BYTES = SCTP_MTU - 32 - 35;
+
 var T0 = Date.now();
 var running = false;
 var role = "caller";
@@ -502,6 +519,13 @@ function createP2PPeerConnection(gen) {
   var p = webrtc.newPeerConnection({
     iceServers: [{ urls: urls, username: turn.username, credential: turn.credential }],
     iceTransportPolicy: "relay",
+    // What the core does about a path that drops in bursts (see tuneConnection in transport/script):
+    sctpMtu: SCTP_MTU,        // one packet of the tunnel is one datagram
+    sctpRtoMaxMs: 3000,       // SCTP's retransmission timer backs off to 60 s by default: the channel is dead meanwhile
+    sctpMinCwnd: 131072,      // the TCP inside has its own congestion control; SCTP's would only slow it a second time
+    paceKBps: 400,            // datagrams leave one by one, not as the dozen SCTP releases on an acknowledgement
+    paceQueue: 48,            // and what waits longer than that is dropped (the signal the TCP inside reacts to)
+    dcBufKB: 96,              // as is what the channel itself holds
   });
   pc = p;
 
@@ -523,7 +547,8 @@ function createP2PPeerConnection(gen) {
   };
 
   if (role === "caller") {
-    dc = p.createDataChannel("x", { ordered: true, maxRetransmits: 0 });
+    // Unordered: a lost datagram must not hold the ones behind it (the TCP inside puts them in order itself).
+    dc = p.createDataChannel("x", { ordered: false, maxRetransmits: 0 });
     wireDataChannel(gen, dc);
   } else {
     p.ondatachannel = function (remote) {
@@ -1120,10 +1145,12 @@ var Transport = {
   info: function () {
     return {
       name: "oneme-webrtc",
-      version: "3.4.0",
+      version: "3.5.0",
       // What a setup page hands over lands in the cookie jar of this address (cookiesApplied).
       cookieDomain: "https://web.max.ru/",
       mtu: 0,
+      carrierMtu: CARRIER_MTU,
+      batchBytes: BATCH_BYTES,
       reliable: false,
       ordered: false,
       // All of them are settings, none is the profile's one input: a profile's value field would otherwise be
@@ -1151,7 +1178,7 @@ var Transport = {
     sessionFails = 0;
     callFails = 0;
     seenOps = {};
-    trace("open 3.4.0: " + role + (calleeID ? ", callee " + calleeID : "") + (chatID ? ", chat " + chatID : ", no chat id") + (maxToken ? "" : ", no token"));
+    trace("open 3.5.0: " + role + (calleeID ? ", callee " + calleeID : "") + (chatID ? ", chat " + chatID : ", no chat id") + (maxToken ? "" : ", no token"));
 
     if (!maxToken) {
       if (role === "receiver") {
