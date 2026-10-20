@@ -1,7 +1,7 @@
 {
   "id": "vyandex",
   "name": "vyandex",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": "OpenFlux",
   "description": "Yandex Volga: packets ride a Volga document session (HTTP relay up, push socket down).",
   "wire": 1,
