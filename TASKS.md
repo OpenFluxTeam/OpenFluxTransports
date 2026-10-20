@@ -3,7 +3,7 @@
 Статусы: `[ ]` ждёт · `[~]` выполняется · `[x]` выполнено и проверено · `[!]` проблема · `[-]` отменено (с причиной).
 Процент = выполненные / (все − отменённые). План: [docs/PLAN-js-migration.md](docs/PLAN-js-migration.md).
 
-## Общий статус: 15 / 31 — 48 %
+## Общий статус: 22 / 31 — 71 %
 
 Ветки: транспорты `OpenFluxTeam/OpenFluxTransports@js-all`, ядро `OpenFluxTeam/OpenFlux@js-transports`,
 клиенты `OpenFluxDesktop/shared` ветка `js-transports` (локально, не запушена).
@@ -60,6 +60,12 @@
 | yandex | [~] | [!] не подключился за 150 с — разбираю |
 | boards | [-] сбой Яндекса | [-] |
 | telemost, vkteams, oneme, mtslink, bitrix, pruffme | [ ] | [ ] |
+
+## 2026-10-21
+- Медиа-хост для конференций в ядре (кадровый такт, RTP, фрагменты, NACK, сборка) + `--native-scripts`.
+- telemost 1.0.0 (WIP): подключается, доходит до serverHello; рукопожатие публикации дорабатывать.
+- vkteams проверен против ноды 141: 10 МБ, 0.40 МБ/с. cupsonline паритет (47 с), mailru JS быстрее натива (103 vs 157 с), vyandex паритет.
+- Клиентский сидинг кук на Android. Таблица — `docs/RESULTS.md`.
 
 ## История
 - 2026-10-20: инвентаризация. В OpenFluxTransports 10 JS-транспортов; JS = копии из ядра (кроме mailru: в ядре 1.2.0 на чате);
