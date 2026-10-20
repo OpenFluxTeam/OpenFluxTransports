@@ -1,0 +1,12 @@
+{
+  "id": "avito",
+  "name": "avito",
+  "version": "1.0.0",
+  "author": "OpenFlux",
+  "description": "Avito Code: packets ride ShareDB text ops in pairs of shared code rooms (an exit can create its rooms).",
+  "wire": 1,
+  "api": 1,
+  "update": [
+    "https://raw.githubusercontent.com/OpenFluxTeam/OpenFluxTransports/updates/avito/update.json"
+  ]
+}

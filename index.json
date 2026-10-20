@@ -32,6 +32,12 @@
       "update": "https://raw.githubusercontent.com/p1neappleXpress/OpenFluxTransports/updates/cupsonline/update.json"
     },
     {
+      "id": "avito",
+      "name": "avito",
+      "description": "Avito Code: packets ride ShareDB text ops in pairs of shared code rooms (an exit can create its rooms).",
+      "update": "https://raw.githubusercontent.com/OpenFluxTeam/OpenFluxTransports/updates/avito/update.json"
+    },
+    {
       "id": "oneme-iceinject",
       "name": "oneme-iceinject",
       "description": "MAX (OneMe): packets ride the call signaling channel (the path the native transport uses).",
