@@ -4,7 +4,7 @@
 name: Check
 on:
   push:
-    branches: [main]
+    branches: [main, js-all]
   pull_request:
 
 permissions:
@@ -17,14 +17,21 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with: { go-version: stable }
+      - name: The OpenFlux core the tools come from (OpenFluxTeam/OpenFlux)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: OpenFluxTeam/OpenFlux
+          ref: ${{ vars.OPENFLUX_REF || 'js-transports' }}
+          path: core
       - name: Build every transport with a throwaway key
         run: |
-          go install github.com/p1neappleXpress/OpenFlux/transport/script/cmd/scriptsign@${{ vars.OPENFLUX_REF || 'nightly' }}
-          scriptsign genkey /tmp/t.priv /tmp/t.pub >/dev/null
+          export OPENFLUX_CORE="$PWD/core"
+          (cd core && go build -o ../tools/ ./transport/script/cmd/scriptsign)
+          tools/scriptsign genkey /tmp/t.priv /tmp/t.pub >/dev/null
           for d in transports/*/; do
             id=$(basename "$d")
             scripts/build.sh "$id" /tmp/t.priv dist
-            scriptsign verify /tmp/t.pub "dist/$id-$(jq -r .version "$d/manifest.json").flux"
+            tools/scriptsign verify /tmp/t.pub "dist/$id-$(jq -r .version "$d/manifest.json").flux"
           done
       - name: The catalog lists every transport, and only transports that exist
         run: |

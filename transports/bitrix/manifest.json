@@ -7,6 +7,6 @@
   "wire": 1,
   "api": 1,
   "update": [
-    "https://raw.githubusercontent.com/p1neappleXpress/OpenFluxTransports/updates/bitrix/update.json"
+    "https://raw.githubusercontent.com/OpenFluxTeam/OpenFluxTransports/updates/bitrix/update.json"
   ]
 }

@@ -6,8 +6,8 @@
 # poll is committed to the `updates` branch as <id>/update.json, one entry per
 # channel, so a stable release never drops the nightly entry.
 #
-# One-time setup: the OpenFlux release key (a one-line hex file from
-# `scriptsign genkey`, the public half of which is OfficialKeyHex in the core)
+# One-time setup: the OpenFluxTeam release key (a one-line hex file from
+# `scriptsign genkey`, the public half of which is OfficialKeyHex in our core)
 # as the repository secret SIGNING_KEY. Rotation: see OpenFlux's
 # docs/scripted-transports.md ("Official keys").
 name: Release
@@ -25,6 +25,12 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with: { go-version: stable }
+      - name: The OpenFlux core the tools come from (OpenFluxTeam/OpenFlux)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: OpenFluxTeam/OpenFlux
+          ref: ${{ vars.OPENFLUX_REF || 'js-transports' }}
+          path: core
 
       - name: Which transport, which version, which channel
         run: |
@@ -53,8 +59,8 @@ jobs:
         if: steps.key.outputs.present == 'true'
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
-          OPENFLUX_REF: ${{ vars.OPENFLUX_REF || 'nightly' }}
         run: |
+          export OPENFLUX_CORE="$PWD/core"
           [ -n "$SIGNING_KEY" ] || { echo "secret SIGNING_KEY is not set"; exit 1; }
           umask 077; printf '%s\n' "$SIGNING_KEY" > /tmp/signing.key
           scripts/build.sh "$ID" /tmp/signing.key dist
@@ -79,7 +85,7 @@ jobs:
             git init -q -b updates /tmp/updates && git -C /tmp/updates remote add origin "$repo"
           fi
           mkdir -p "/tmp/updates/$ID"
-          scriptsign index -channel="$CHANNEL" \
+          dist/bin/scriptsign index -channel="$CHANNEL" \
             -url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${ID}-${VERSION}.flux" \
             -notes="$notes" "/tmp/updates/$ID/update.json" "dist/${ID}-${VERSION}.flux"
           cd /tmp/updates
