@@ -20,7 +20,7 @@
 var UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
 var BASE_ROOM_URL = "https://interview.cups.online/live-coding/";
 
-var NUM_ROOMS = 8;
+var NUM_ROOMS = 8; // an exit creates this many rooms = stripe lanes; cfg.params.rooms overrides
 var WS_HANDSHAKE_MS = 15000;
 var WS_READ_TIMEOUT_MS = 90000;
 var KEEPALIVE_MS = 20000;
@@ -800,12 +800,13 @@ var Transport = {
   info: function () {
     return {
       name: "cupsonline",
-      version: "1.2.0",
+      version: "1.3.0",
       mtu: 0,
       reliable: false,
       ordered: false,
       params: [
         { key: "url", label: "Packed room list (?rooms=... or ?room=...); empty on an exit creates new rooms", type: "text", required: false },
+        { key: "rooms", label: "Rooms an exit creates (= parallel lanes; more = faster, 8 default)", type: "number", required: false, scope: "settings", default: "8" },
       ],
     };
   },
@@ -816,6 +817,8 @@ var Transport = {
     // The core tells every script its role (params.exit); a client never
     // creates rooms of its own.
     isClient = !(p.exit === true || p.exit === "true");
+    var nr = parseInt(p.rooms, 10);
+    if (nr >= 1 && nr <= 48) NUM_ROOMS = nr;
     striped = list.ids.length ? list.striped : true; // an exit's new rooms are striped
     running = true;
     setState("connecting");
