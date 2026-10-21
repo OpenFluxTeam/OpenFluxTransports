@@ -1,57 +1,17 @@
 // PRUFFME whiteboard transport - packets ride notify-position broadcasts (the
-// moving cursor) on a shared PRUFFME "landing dashboard" (a Miro-like
-// collaborative whiteboard at pruffme.com, e.g.
-// https://pruffme.com/landing/u<id>/<login>).
+// moving cursor) on a shared PRUFFME landing dashboard. A cursor move is
+// relayed to the others and never stored, so nothing is left on the board.
+// The packet is base64 in position.x; the server relays it as an array,
+// data = [sender, session, name, 0, "<base64>", ...]. The sender's own echo
+// is skipped (data[0] is its participant hash).
 //
-// Same protocol family as boards.yandex.ru (see ../boards/main.js): Socket.IO
-// v4 (EIO=4/websocket), a "dashboard" event channel, subscribe-slide-dashboard,
-// then a dashboard event to write and the server's relay of it to read. The
-// differences:
-//
-//   1. Auth is a POST /engine/ pair (sockets-info, login-media; the action in
-//      a form field, the body base64-wrapped JSON) - no cookie/JWT dance, no
-//      captcha seen in testing, the participant comes back in the response.
-//   2. The board hash and the (single) slide hash are not in the URL: they are
-//      a JSON blob inside an inline <script> of the landing page
-//      (`embedded_media_content`). The URL is just the page to fetch.
-//   3. The carrier is notify-position, not a cell. A cursor move is relayed to
-//      the others and never stored, so nothing is left on the board and there
-//      is nothing to delete. The packet is base64 in position.x; the server
-//      relays it as an array, data = [sender, session, name, 0, "<base64>", ...].
-//      The sender gets its own echo (data[0] is its participant hash).
-//
-// Why not cells, as boards does (modify-objects with a 1x1 text cell, deleted
-// by the receiver with drop-objects)? Measured on this board, 2026-10-07:
-//   * a bare {id, value} object is relayed once, then the server resets the
-//     SENDER's socket (50-250 ms later) - at 5 packets/s as much as at 200/s;
-//   * a full cell works, but is stored: above ~150 packets/s the server stores
-//     cells later than the receiver deletes them, so most of them stay (4281
-//     of 4500 at 300/s; a second delete 3 s later still left 306), and the
-//     board's document, which every subscribe sends in full, grows by the
-//     hour - at 300/s the latency also doubles (75 ms against 38 ms).
-//
-// What was measured for this carrier (two clients of this script on the same
-// board, a 1-CPU VDS abroad, numbered packets, one clock; ~25 000 packets a run
-// at most, the server's load moves the limit by a few dozen packets/s):
-//   * no loss and no duplicate at any rate up to the limit: 300 packets/s at
-//     33 ms; the limit is ~400-470 packets/s, 540-650 KB/s with 1400-byte
-//     packets, and above it the queue grows (latency 3-5 s, nothing lost).
-//     At 200 packets/s for 90 s: 18 000 of 18 000, 31 ms, no reconnect.
-//   * both directions at once, 150 packets/s each: no loss, 35 ms.
-//   * packets of 1 MB cross whole: the size is no limit for a tunnel.
-//   * the server relays out of order: from ~50 packets/s a few percent
-//     overtake each other (10% at 150/s, 14% at 300/s) - hence ordered:false.
-//   * a connection that stays silent for 150 s lives on its own: the server
-//     pings every 25 s and the answer is all it wants. No dashboard heartbeat.
-//   * a killed socket comes back on the next socket server of the list with
-//     the same participant; what was in flight at that moment is lost (2 of
-//     400 packets), what was queued is not.
-//
-// The board must grant "anyone with the link can edit" (an operator-side
-// setting on pruffme.com): the subscribe answer carries `editor: true|false`,
-// and the notes this transport grew from say a view-only guest's writes are
-// dropped silently. Whether such a guest can still move its cursor was not
-// tested (no view-only board at hand). One board per concurrent client/exit pair.
+// Several boards = several independent relay paths. The url may list more than
+// one board (comma / whitespace / '|' separated): each becomes a lane of the
+// core's stripe (lanes.open), so N boards carry N times a single board's ~6
+// Mbit. One board is one lane - the same wire, no stripe gain. Each board is
+// its own Socket.IO session with its own participant, so lane i only hears
+// lane i: no cross-delivery between boards. Both ends must list the same
+// boards, in the same order.
 
 var PRUFFME_BASE = "pruffme.com";
 var UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
@@ -59,26 +19,27 @@ var UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
 var SOCKET_PORT_DEFAULT = 443;
 var READ_DEADLINE_MS = 90000;
 var HANDSHAKE_WAIT_MS = 15000;
-var BOOTSTRAP_ATTEMPTS = 6; // transient failures while fetching the page / logging in
+var BOOTSTRAP_ATTEMPTS = 6;
+
+// The stripe over the boards: Socket.IO loses nothing while up (no spare
+// copies), answers in tens of ms, a lane is dead only after seconds of
+// silence. A piece ~ one notify-position's base64 payload.
+var STRIPE = {
+  pieceBytes: 8192,
+  deadAfterMs: 6000,
+  noDups: true,
+  initRtoMs: 2000,
+  minRtoMs: 1000,
+  maxRtoMs: 8000,
+  noPacing: true,
+  ackIntervalMs: 100,
+  holeDeadlineMs: 10000,
+  laneWindow: true,
+};
 
 var running = false;
-var landingURL = "";
-var boardHash = "";
-var slideHash = "";
-var socketServers = [];   // sockets-info's list; every connection takes the next one
-var serverIdx = 0;
-var participant = null;   // full participant object, as login-media returned it
-var participantHash = "";
-var sessionId = "";
-
-var sock = null;
-var ready = false;       // the subscribe answer has arrived: write() may go
-var ack = 0;
-var reconnectAttempt = 0;
-var reconnectTimer = null;
-var connectGen = 0;      // bumped by every connectOnce: a stale attempt closes what it opened
-var bootGen = 0;         // the same for the page fetch / login
-var connectedSince = 0;
+var lanes_ = [];
+var striped = false;
 
 function randHex(n) {
   var s = "";
@@ -86,27 +47,48 @@ function randHex(n) {
   return s;
 }
 
-// fatal: an error no retry can cure (the board is gone, not a PRUFFME page).
-function fatal(msg) {
-  var e = new Error(msg);
-  e.fatal = true;
-  return e;
+function fatal(msg) { var e = new Error(msg); e.fatal = true; return e; }
+function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+function reconnectBackoff(n) {
+  if (n < 1) n = 1;
+  var d = Math.min(500 * Math.pow(2, Math.min(n - 1, 4)), 15000);
+  return d + Math.floor(Math.random() * (d / 2 + 1));
 }
 
-function sleep(ms) {
-  return new Promise(function (resolve) { setTimeout(resolve, ms); });
+function parseBoards(raw) {
+  raw = (raw || "").trim();
+  if (!raw) return [];
+  return raw.split(/[\s,|]+/).filter(function (x) { return x; });
 }
 
-// ---- auth / bootstrap ----
+// ---- one board = one lane ----
 
-// extractEmbedded: the landing page embeds the board's JSON as a plain
-// (non-escaped) object inside a JS block comment:
-//   var embedded_media_content = function(){/*  {...json...}  */}.toString().slice(15,-3);
-// Pull the comment body out and parse it directly - it is already valid JSON.
+function Lane(idx, url) {
+  this.idx = idx;
+  this.url = url;
+  this.boardHash = "";
+  this.slideHash = "";
+  this.participant = null;
+  this.participantHash = "";
+  this.socketServers = [];
+  this.serverIdx = 0;
+  this.sessionId = "";
+  this.sock = null;
+  this.ready = false;
+  this.ack = 0;
+  this.pendingWaiters = [];
+  this.reconnectAttempt = 0;
+  this.reconnectTimer = null;
+  this.connectGen = 0;
+  this.bootGen = 0;
+  this.connectedSince = 0;
+  this.session = http.newSession(); // its own cookie jar
+}
+
 function extractEmbedded(html) {
-  var marker = "embedded_media_content";
-  var idx = html.indexOf(marker);
-  if (idx === -1) throw new Error("pruffme: embedded_media_content not found in landing page");
+  var idx = html.indexOf("embedded_media_content");
+  if (idx === -1) throw new Error("pruffme: embedded_media_content not found");
   var openIdx = html.indexOf("/*", idx);
   if (openIdx === -1) throw new Error("pruffme: comment open not found");
   var closeIdx = html.indexOf("*/", openIdx + 2);
@@ -114,27 +96,22 @@ function extractEmbedded(html) {
   return JSON.parse(html.slice(openIdx + 2, closeIdx).trim());
 }
 
-// extractSlideHash: board.items is base64(JSON([{hash, url}, ...])) - a
-// single-page whiteboard has exactly one entry; take it.
 function extractSlideHash(board) {
   if (!board || !board.items) return "";
   try {
     var arr = JSON.parse(text.decode(base64.decode(board.items)));
     if (arr && arr.length > 0 && arr[0].hash) return arr[0].hash;
-  } catch (e) { /* fall through */ }
+  } catch (e) {}
   return "";
 }
 
-async function enginePost(action, content) {
+Lane.prototype.enginePost = async function (action, content) {
   var body = "action=" + encodeURIComponent(action) +
     "&content=" + encodeURIComponent(base64.encode(text.encode(JSON.stringify(content))));
-  var res = await http.fetch({
+  var res = await this.session.fetch({
     url: "https://" + PRUFFME_BASE + "/engine/",
     method: "POST",
-    headers: {
-      "User-Agent": UA,
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
+    headers: { "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded" },
     body: body,
   });
   if (res.status !== 200) throw new Error("pruffme: engine/" + action + " HTTP " + res.status);
@@ -142,344 +119,309 @@ async function enginePost(action, content) {
   try { data = JSON.parse(res.body); } catch (e) { throw new Error("pruffme: engine/" + action + " bad JSON"); }
   if (data && data.error) throw fatal("pruffme: engine/" + action + " error " + JSON.stringify(data.error));
   return data;
-}
+};
 
-async function authorize(raw) {
-  var res = await http.fetch({
-    url: raw,
+Lane.prototype.authorize = async function () {
+  var res = await this.session.fetch({
+    url: this.url,
     method: "GET",
-    headers: {
-      "User-Agent": UA,
-      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "en-US,en;q=0.9",
-    },
+    headers: { "User-Agent": UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.9" },
   });
   if (res.status === 403 || res.status === 404 || res.status === 410) {
     throw fatal("pruffme: landing page HTTP " + res.status + " (no such board, or it is closed)");
   }
   if (res.status !== 200) throw new Error("pruffme: landing page HTTP " + res.status);
-
   var board;
   try { board = extractEmbedded(res.body); } catch (e) { throw fatal(String(e.message || e)); }
   if (!board.hash) throw fatal("pruffme: no board hash in landing page");
-  boardHash = board.hash;
-  slideHash = extractSlideHash(board);
-  if (!slideHash) throw fatal("pruffme: no slide hash in board.items");
+  this.boardHash = board.hash;
+  this.slideHash = extractSlideHash(board);
+  if (!this.slideHash) throw fatal("pruffme: no slide hash in board.items");
 
-  var si = await enginePost("sockets-info", {});
-  if (!si.socket_servers || si.socket_servers.length === 0) {
-    throw new Error("pruffme: sockets-info returned no socket_servers");
-  }
-  // the entries are host names (socket-landingNN.pruffme.com) despite the field's name, "ip"
-  socketServers = si.socket_servers.map(function (s) { return s.ip + ":" + (s.vport || SOCKET_PORT_DEFAULT); });
-  serverIdx = Math.floor(Math.random() * socketServers.length);
+  var si = await this.enginePost("sockets-info", {});
+  if (!si.socket_servers || si.socket_servers.length === 0) throw new Error("pruffme: sockets-info empty");
+  this.socketServers = si.socket_servers.map(function (s) { return s.ip + ":" + (s.vport || SOCKET_PORT_DEFAULT); });
+  this.serverIdx = Math.floor(Math.random() * this.socketServers.length);
 
-  var lm = await enginePost("login-media", { media: boardHash, questions: [], utms: {}, devices: {} });
-  if (!lm.participant || !lm.participant.hash) {
-    throw new Error("pruffme: login-media did not return a participant");
-  }
-  participant = lm.participant;
-  participantHash = participant.hash;
-}
+  var lm = await this.enginePost("login-media", { media: this.boardHash, questions: [], utms: {}, devices: {} });
+  if (!lm.participant || !lm.participant.hash) throw new Error("pruffme: login-media no participant");
+  this.participant = lm.participant;
+  this.participantHash = this.participant.hash;
+};
 
-// bootstrap: the page fetch and the login, retried while the failure can be
-// transient (network, 5xx); a fatal one ends the transport at once.
-async function bootstrap() {
-  var myBoot = ++bootGen;
+Lane.prototype.bootstrap = async function () {
+  var myBoot = ++this.bootGen;
   for (var n = 1; ; n++) {
     try {
-      await authorize(landingURL);
-      return running && myBoot === bootGen;
+      await this.authorize();
+      return running && myBoot === this.bootGen;
     } catch (e) {
-      if (!running || myBoot !== bootGen) return false;
-      if ((e && e.fatal) || n >= BOOTSTRAP_ATTEMPTS) {
-        giveUp(e);
-        return false;
-      }
+      if (!running || myBoot !== this.bootGen) return false;
+      if ((e && e.fatal) || n >= BOOTSTRAP_ATTEMPTS) { giveUp(e); return false; }
       setState("reconnecting", String(e));
       await sleep(reconnectBackoff(n));
-      if (!running || myBoot !== bootGen) return false;
+      if (!running || myBoot !== this.bootGen) return false;
     }
   }
-}
+};
 
-// giveUp: end the transport for good (running=false so no reconnect follows).
-function giveUp(e) {
-  running = false;
-  connectGen++;
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  closeSocket();
-  setState("dead", String(e));
-}
-
-// ---- wire framing (Engine.IO v4 / Socket.IO v4, hand-rolled - same
-// family as boards.js) ----
-
-function writeEventObj(ns, obj) {
-  var id = ack;
-  ack++;
-  sock.send("42" + id + JSON.stringify([ns, obj]));
+Lane.prototype.writeEventObj = function (ns, obj) {
+  var id = this.ack++;
+  this.sock.send("42" + id + JSON.stringify([ns, obj]));
   return id;
-}
+};
 
-function sendSubscribe() {
-  sessionId = randHex(32);
-  var data = {
-    session: sessionId,
-    dashboard: slideHash,
-    presentation: boardHash,
-    properties: {},
-    participant: participantHash,
-    participant_team_role: -1,
-    options: { type: "landing", participant: participant, intermediate: randHex(32) },
-  };
-  return writeEventObj("dashboard", { action: "subscribe-slide-dashboard", data: data });
-}
-
-// sendNotifyPosition: the packet as a cursor move, the format the original
-// client uses. Fire-and-forget: not awaited, a ~35 ms round trip per packet
-// would cap the throughput at a few dozen packets/s. The server's answer
-// (43N[{"result":true}]) is ignored.
-function sendNotifyPosition(bytes) {
-  writeEventObj("dashboard", {
-    action: "notify-position",
+Lane.prototype.sendSubscribe = function () {
+  this.sessionId = randHex(32);
+  return this.writeEventObj("dashboard", {
+    action: "subscribe-slide-dashboard",
     data: {
-      position: { x: base64.encode(bytes), y: 123.0 },
-      vpt: { translate: { x: 0, y: 0 }, scale: 1, whyrugay: 1 },
+      session: this.sessionId, dashboard: this.slideHash, presentation: this.boardHash,
+      properties: {}, participant: this.participantHash, participant_team_role: -1,
+      options: { type: "landing", participant: this.participant, intermediate: randHex(32) },
     },
-    participant: participantHash,
   });
-}
+};
 
-// ---- receiving ----
+Lane.prototype.sendPiece = function (bytes) {
+  this.writeEventObj("dashboard", {
+    action: "notify-position",
+    data: { position: { x: base64.encode(bytes), y: 123.0 }, vpt: { translate: { x: 0, y: 0 }, scale: 1, whyrugay: 1 } },
+    participant: this.participantHash,
+  });
+};
 
-function deliver(b64) {
+Lane.prototype.deliver = function (b64) {
   if (typeof b64 !== "string" || b64 === "") return;
-  try {
-    var bytes = base64.decode(b64);
-    if (bytes.byteLength > 0) emit(bytes);
-  } catch (e) { /* not base64: somebody's real cursor, not ours */ }
-}
+  var bytes;
+  try { bytes = base64.decode(b64); } catch (e) { return; } // a real cursor, not ours
+  if (!bytes || bytes.byteLength === 0) return;
+  if (striped) lanes.deliver(this.idx, bytes);
+  else emit(bytes);
+};
 
-// handleNotifyPosition: the array form pruffme's server relays (data[0] =
-// sender, data[4] = our payload) and the object form (data.position.x) that
-// boards' server relays. Our own echo is skipped.
-function handleNotifyPosition(data, envelopePart) {
+Lane.prototype.handleNotifyPosition = function (data, envelopePart) {
   if (Array.isArray(data)) {
-    if (data.length < 5 || data[0] === participantHash) return;
-    deliver(data[4]);
+    if (data.length < 5 || data[0] === this.participantHash) return;
+    this.deliver(data[4]);
     return;
   }
   if (data && data.position) {
-    if (envelopePart && envelopePart === participantHash) return;
-    deliver(data.position.x);
+    if (envelopePart && envelopePart === this.participantHash) return;
+    this.deliver(data.position.x);
   }
-}
+};
 
-function handleMessage(msg) {
-  if (msg === "2") { try { sock.send("3"); } catch (e) {} return; } // engine.io ping -> pong
-  if (msg === "3") return; // pong, nothing to do
-  if (msg.indexOf("42[") !== 0) return; // acks (43N[...]) and the rest: nothing to do
+Lane.prototype.handleMessage = function (msg) {
+  if (msg === "2") { try { this.sock.send("3"); } catch (e) {} return; }
+  if (msg === "3") return;
+  if (msg.indexOf("42[") !== 0) return;
   var arr;
   try { arr = JSON.parse(msg.slice(2)); } catch (e) { return; }
-  if (!arr || arr.length < 2) return;
-  var envelope = arr[1];
-  if (arr[0] !== "dashboard" || !envelope) return;
-  if (envelope.action === "notify-position") handleNotifyPosition(envelope.data, envelope.participant);
-}
+  if (!arr || arr.length < 2 || arr[0] !== "dashboard" || !arr[1]) return;
+  if (arr[1].action === "notify-position") this.handleNotifyPosition(arr[1].data, arr[1].participant);
+};
 
-// ---- handshake sync helpers (a small promise-based waiter queue bridges the
-// handshake's synchronous awaits before the general onmessage handler takes
-// over - same pattern as boards.js) ----
+Lane.prototype.waitRaw = function () {
+  var l = this;
+  return new Promise(function (resolve) { l.pendingWaiters.push({ pred: function () { return true; }, resolve: resolve }); });
+};
 
-var pendingWaiters = [];
-
-function waitRaw() {
-  return new Promise(function (resolve) {
-    pendingWaiters.push({ pred: function () { return true; }, resolve: resolve });
-  });
-}
-
-function waitFor(pred, timeoutMs) {
+Lane.prototype.waitFor = function (pred, timeoutMs) {
+  var l = this;
   return new Promise(function (resolve) {
     var waiter = { pred: pred, done: false };
     var timer = setTimeout(function () {
       if (waiter.done) return;
       waiter.done = true;
-      var i = pendingWaiters.indexOf(waiter);
-      if (i >= 0) pendingWaiters.splice(i, 1);
+      var i = l.pendingWaiters.indexOf(waiter);
+      if (i >= 0) l.pendingWaiters.splice(i, 1);
       resolve(false);
     }, timeoutMs);
-    waiter.resolve = function () {
-      if (waiter.done) return;
-      waiter.done = true;
-      clearTimeout(timer);
-      resolve(true);
-    };
-    pendingWaiters.push(waiter);
+    waiter.resolve = function () { if (waiter.done) return; waiter.done = true; clearTimeout(timer); resolve(true); };
+    l.pendingWaiters.push(waiter);
   });
-}
+};
 
-function dispatchToWaiters(msg) {
-  for (var i = 0; i < pendingWaiters.length; i++) {
-    if (pendingWaiters[i].pred(msg)) {
-      var w = pendingWaiters.splice(i, 1)[0];
+Lane.prototype.dispatch = function (msg) {
+  for (var i = 0; i < this.pendingWaiters.length; i++) {
+    if (this.pendingWaiters[i].pred(msg)) {
+      var w = this.pendingWaiters.splice(i, 1)[0];
       w.resolve();
       return true;
     }
   }
   return false;
-}
+};
 
-function onSocketMessage(msg) {
-  if (msg === "2") { try { sock.send("3"); } catch (e) {} return; } // always answer a ping, even mid-handshake
-  if (dispatchToWaiters(msg)) return;
-  handleMessage(msg);
-}
-
-async function handshake() {
-  await waitRaw(); // engine.io open "0{...}"
-  sock.send("40"); // connect default namespace
-  await waitRaw(); // socket.io connect ack "40{sid}"
-
-  writeEventObj("im", { operation: "subscribe", user: null });
-  var subscribed = await waitFor(function (m) { return m.indexOf('"subscribed"') !== -1; }, 10000);
-  if (!subscribed) throw new Error("pruffme: wait 'subscribed': timed out");
-
-  var subAck = sendSubscribe();
+Lane.prototype.handshake = async function () {
+  await this.waitRaw(); // engine.io open
+  this.sock.send("40");
+  await this.waitRaw(); // socket.io connect ack
+  this.writeEventObj("im", { operation: "subscribe", user: null });
+  var self = this;
+  var subscribed = await this.waitFor(function (m) { return m.indexOf('"subscribed"') !== -1; }, 10000);
+  if (!subscribed) throw new Error("pruffme: wait 'subscribed' timed out");
+  var subAck = this.sendSubscribe();
   var prefix = "43" + subAck + "[";
-  var got = await waitFor(function (m) { return m.indexOf(prefix) === 0; }, HANDSHAKE_WAIT_MS);
-  if (!got) throw new Error("pruffme: wait subscribe-slide-dashboard ack: timed out");
-}
+  var got = await this.waitFor(function (m) { return m.indexOf(prefix) === 0; }, HANDSHAKE_WAIT_MS);
+  if (!got) throw new Error("pruffme: wait subscribe ack timed out");
+};
 
-// ---- reconnect / lifecycle ----
+Lane.prototype.closeSocket = function () {
+  this.ready = false;
+  if (striped) lanes.state(this.idx, false);
+  var s = this.sock;
+  this.sock = null;
+  if (s) try { s.close(); } catch (e) {}
+};
 
-function reconnectBackoff(n) {
-  if (n < 1) n = 1;
-  var shift = n - 1;
-  if (shift > 4) shift = 4;
-  var d = 500 * Math.pow(2, shift);
-  if (d > 15000) d = 15000;
-  d += Math.floor(Math.random() * (d / 2 + 1));
-  return d;
-}
+Lane.prototype.scheduleNextConnect = function () {
+  if (!running || this.reconnectTimer) return;
+  var l = this;
+  var d = reconnectBackoff(this.reconnectAttempt);
+  this.reconnectAttempt = Math.min(this.reconnectAttempt + 1, 10);
+  this.reconnectTimer = setTimeout(function () { l.reconnectTimer = null; if (running) l.connectOnce(); }, d);
+};
 
-function scheduleNextConnect() {
-  if (!running) return;
-  if (reconnectTimer) return; // one is already pending
-  var d = reconnectBackoff(reconnectAttempt);
-  reconnectAttempt++;
-  if (reconnectAttempt > 10) reconnectAttempt = 10;
-  reconnectTimer = setTimeout(function () {
-    reconnectTimer = null;
-    if (running) connectOnce();
-  }, d);
-}
+Lane.prototype.connectOnce = function () {
+  var myGen = ++this.connectGen;
+  var l = this;
+  this.connectAndServe(myGen).then(null, function (e) {
+    if (myGen !== l.connectGen) return;
+    l.closeSocket();
+    if (e && e.fatal) { giveUp(e); return; }
+    setState("reconnecting", String(e));
+    l.scheduleNextConnect();
+  });
+};
 
-function connectOnce() {
-  var myGen = ++connectGen;
-  connectAndServe(myGen).then(
-    function () { /* connected; onSocketClose schedules the next retry when it eventually closes */ },
-    function (e) {
-      if (myGen !== connectGen) return; // superseded
-      closeSocket(); // a half-open socket must not outlive its failed handshake
-      setState("reconnecting", String(e));
-      scheduleNextConnect();
-    }
-  );
-}
-
-function closeSocket() {
-  ready = false;
-  var s = sock;
-  sock = null;
-  if (s) { try { s.close(); } catch (e) {} }
-}
-
-function onSocketClose() {
-  sock = null;
-  ready = false;
-  if (connectedSince && Date.now() - connectedSince > 60000) reconnectAttempt = 0;
-  connectedSince = 0;
-  if (!running) return;
-  setState("reconnecting");
-  scheduleNextConnect();
-}
-
-async function connectAndServe(myGen) {
-  ack = 0; // every connection numbers its own Socket.IO events from 0 -
-           // the handshake's subscribe-ack wait depends on this
-  pendingWaiters = [];
-  ready = false;
-
-  var host = socketServers[serverIdx % socketServers.length];
-  serverIdx++; // the next connection - a retry after a failure - takes the next server
-  var wsURL = "wss://" + host + "/socket.io/?EIO=4&transport=websocket";
-  var newSock = await ws.open(wsURL, {
-    "User-Agent": UA,
-    "Origin": "https://" + PRUFFME_BASE,
-  }, { readTimeoutMs: READ_DEADLINE_MS });
-
-  if (myGen !== connectGen || !running) {
-    try { newSock.close(); } catch (e) {}
-    return;
-  }
-
-  sock = newSock;
-  sock.onmessage = onSocketMessage;
-  sock.onclose = function () {
-    if (sock !== newSock) return; // already replaced/dropped on purpose
-    onSocketClose();
+Lane.prototype.connectAndServe = async function (myGen) {
+  this.ack = 0;
+  this.pendingWaiters = [];
+  this.ready = false;
+  var host = this.socketServers[this.serverIdx % this.socketServers.length];
+  this.serverIdx++;
+  var l = this;
+  var newSock = await ws.open("wss://" + host + "/socket.io/?EIO=4&transport=websocket",
+    { "User-Agent": UA, "Origin": "https://" + PRUFFME_BASE }, { readTimeoutMs: READ_DEADLINE_MS });
+  if (myGen !== this.connectGen || !running) { try { newSock.close(); } catch (e) {} return; }
+  this.sock = newSock;
+  newSock.onmessage = function (m) {
+    if (m === "2") { try { newSock.send("3"); } catch (e) {} return; }
+    if (l.dispatch(m)) return;
+    l.handleMessage(m);
   };
+  newSock.onclose = function () { if (l.sock === newSock) l.onSocketClose(); };
+  await this.handshake();
+  if (myGen !== this.connectGen || !running) return;
+  this.ready = true;
+  this.connectedSince = Date.now();
+  this.reconnectAttempt = 0;
+  if (striped) { lanes.state(this.idx, true); this.pump(); }
+  updateState();
+};
 
-  await handshake();
-  if (myGen !== connectGen || !running) return;
+Lane.prototype.onSocketClose = function () {
+  this.sock = null;
+  this.ready = false;
+  if (striped) lanes.state(this.idx, false);
+  if (this.connectedSince && Date.now() - this.connectedSince > 60000) this.reconnectAttempt = 0;
+  this.connectedSince = 0;
+  if (!running) return;
+  updateState();
+  this.scheduleNextConnect();
+};
 
-  ready = true;
-  connectedSince = Date.now();
-  reconnectAttempt = 0;
-  setState("connected");
+// pump drains the stripe for this lane, fire-and-forget (Socket.IO is ordered
+// and reliable while up, so no per-piece ack wait - that would cap the rate).
+Lane.prototype.pump = function () {
+  if (!striped || !this.ready || !this.sock) return;
+  var pieces = lanes.pull(this.idx, 64);
+  while (pieces.length) {
+    for (var i = 0; i < pieces.length; i++) {
+      try { this.sendPiece(new Uint8Array(pieces[i])); } catch (e) { return; }
+    }
+    if (pieces.length < 64) break;
+    pieces = lanes.pull(this.idx, 64);
+  }
+};
+
+function giveUp(e) {
+  running = false;
+  for (var i = 0; i < lanes_.length; i++) {
+    lanes_[i].connectGen++;
+    if (lanes_[i].reconnectTimer) { clearTimeout(lanes_[i].reconnectTimer); lanes_[i].reconnectTimer = null; }
+    lanes_[i].closeSocket();
+  }
+  setState("dead", String(e));
+}
+
+function updateState() {
+  for (var i = 0; i < lanes_.length; i++) if (lanes_[i].ready) { setState("connected"); return; }
+  if (running) setState("reconnecting");
+}
+
+async function startLanes(urls) {
+  lanes_ = urls.map(function (u, i) { return new Lane(i, u); });
+  striped = urls.length >= 2;
+  var oks = await Promise.all(lanes_.map(function (l) { return l.bootstrap(); }));
+  if (!running) return;
+  if (oks.indexOf(true) === -1) { if (running) setState("dead", "pruffme: no board could be opened"); return; }
+  if (striped) lanes.open(lanes_.length, STRIPE);
+  console.log("[PRUFFME] " + lanes_.length + " board(s), striped=" + striped);
+  for (var i = 0; i < lanes_.length; i++) if (oks[i]) lanes_[i].connectOnce();
 }
 
 var Transport = {
   info: function () {
     return {
       name: "pruffme",
-      version: "1.0.0",
+      version: "1.1.0",
       cookieDomain: "",
-      mtu: 0,
-      reliable: false,
-      ordered: false,
+      mtu: 0, reliable: false, ordered: false,
       params: [
         { key: "url", label: "PRUFFME whiteboard URL", type: "url", required: true,
-          description: "The board must have \"anyone with the link can edit\" turned on." },
+          description: "The board must have \"anyone with the link can edit\" on." },
+        { key: "boards", label: "More boards for speed (space-separated, including this one)", type: "textarea", required: false, scope: "settings",
+          description: "List several landing boards to run them as parallel lanes - N boards carry N times one board's speed." },
       ],
     };
   },
 
   open: function (cfg) {
-    landingURL = (cfg.params && cfg.params.url) || cfg.url || "";
-    if (!landingURL) {
-      setState("dead", "pruffme: no board URL provided");
-      return;
-    }
+    var p = cfg.params || {};
+    // Boards come in the "boards" param (space/comma separated). The url field
+    // holds one board; a comma-list there would be caught by the core as a
+    // group (unsupported for scripts), so several boards ride "boards".
+    var urls = parseBoards(p.boards || p.url || cfg.url || "");
+    if (!urls.length) { setState("dead", "pruffme: no board URL provided"); return; }
     running = true;
     setState("connecting");
-
-    bootstrap().then(function (ok) { if (ok) connectOnce(); });
+    startLanes(urls);
   },
 
   write: function (bytes) {
-    if (!sock || !ready || !running) throw new Error("pruffme: not connected");
-    sendNotifyPosition(bytes);
+    // Single board: straight to its lane (no stripe). Several: the core's
+    // Send went to the stripe, and the lanes pull from it - write() is not
+    // called in that case.
+    if (striped) return;
+    var l = lanes_[0];
+    if (!l || !l.ready) throw new Error("pruffme: not connected");
+    l.sendPiece(new Uint8Array(bytes));
   },
+
+  laneWake: function (i) { if (lanes_[i]) lanes_[i].pump(); },
+
+  // The stripe's own out-of-band frames (acks) ride a notify-position too.
+  laneSend: function (i, data) { var l = lanes_[i]; if (l && l.ready) try { l.sendPiece(new Uint8Array(data)); } catch (e) {} },
 
   close: function () {
     running = false;
-    connectGen++;
-    bootGen++;
-    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-    pendingWaiters = [];
-    closeSocket();
+    for (var i = 0; i < lanes_.length; i++) {
+      if (lanes_[i].reconnectTimer) clearTimeout(lanes_[i].reconnectTimer);
+      lanes_[i].closeSocket();
+    }
+    lanes_ = [];
   },
 };
