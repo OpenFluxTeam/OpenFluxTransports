@@ -51,6 +51,50 @@ var SCTP_MTU = 1360;
 var CARRIER_MTU = 1200;
 var BATCH_BYTES = SCTP_MTU - 32 - 35;
 
+// ── The leg to the TURN server ──
+//
+// Each end reaches its relay over UDP or over TCP (a TURN server answers TCP on the port it answers UDP on).
+// Measured both ways on the phone, Wi-Fi and mobile network alike: the speed is the same, so both use UDP.
+// The table is there for a network that lets only TCP through.
+var TURN_TRANSPORT = { caller: "udp", receiver: "udp" };
+var NODE_DIRECT = true;
+
+// ── Lanes ──
+//
+// One relay allocation moves about 10 KB/s here, whatever the access network and whatever the datagram
+// size: the same STUN requests to the same server go through at 80 KB/s, so the limit is the relay's, per
+// allocation. A call may hold more than one, but a user's allocations at the call's two TURN servers stop at
+// about twenty (the next one is refused). The node, which is reached directly and needs no relay of its own,
+// hands its own call credentials over, and the lanes beyond the twentieth allocate with those. Besides the
+// call's own PeerConnection (lane 0) the client
+// opens LANES - 1 more, each with a TURN allocation and a data channel of its own, and the tunnel's
+// packets are dealt out over every channel that is open. A lane is a help only: one that fails is dropped
+// and the call goes on with the rest.
+var LANES = NODE_DIRECT ? 39 : 19;
+var LANES_OWN = 19;                     // lanes below this allocate with the call's own credentials, the rest with the node's
+var LANE_PEER_WAIT_MS = 10000;          // how long the client waits for the node to hand its credentials over
+var LANE_OPEN_GAP_MS = 300;             // the client starts its lanes this far apart
+var LANE_OFFER_RESEND_MS = [7000, 16000]; // a lane's offer again, when no answer has come
+var LANE_CONNECT_DEADLINE_MS = 30000;   // a lane with no open channel by then is dropped
+var LANE_RETRY_MS = 15000;              // and the client tries it again after this, ...
+var LANE_TRIES = 3;                     // ... this many times in all
+
+// ── Dealing the packets over the lanes ──
+//
+// A lane's relay moves about 10.4 KB/s (wire bytes, headers included) and drops what it is offered above that
+// in bursts: the TCP inside the tunnel meets heavy loss, takes it for congestion and sends far less than the
+// lanes could carry. So the tunnel's packets wait in ONE queue and leave for whichever lane has earned the
+// bytes: each lane is let LANE_RATE a second, the queue is drained in order (no lane has a longer backlog than
+// another, so nothing arrives out of order), and what the queue cannot hold is dropped, the signal the TCP
+// inside reacts to. A packet as small as an ACK jumps the queue.
+var LANE_RATE = 9500;             // wire bytes per second a lane is dealt (0 = no pacing: packets go out at once)
+var laneRate = LANE_RATE;         // the node takes the client's value (a cfg message over the call's channel)
+var WIRE_OVERHEAD = 100;          // what SCTP, DTLS, TURN, UDP and IP put around a record
+var SMALL_RECORD = 200;           // a record this small (an ACK) jumps the queue
+var QUEUE_MS = 400;               // the queue holds this much of the lanes' combined rate
+var PUMP_MS = 4;
+var CREDIT_MS = 150;              // a lane saves up this much credit: a packet, never a burst
+
 var T0 = Date.now();
 var running = false;
 var role = "caller";
@@ -105,6 +149,17 @@ var pc = null;
 var dc = null;
 var dcOpen = false;
 var dcOpenAt = 0;
+var lanes = [];                     // lanes[k], k >= 1: the extra PeerConnections (see Lanes)
+var laneTimers = [];                // the client's pending lane starts and retries
+var laneTries = [];
+var sendDCs = [];                   // the open data channels (the call's own first): what write() deals over
+var peerTurn = null;                // the node's TURN credentials, handed over once the call's channel is open (client)
+var sendRR = 0;
+var txq = [];                       // the records that wait for a lane, oldest first: {b, cost}
+var txQueued = 0;                   // their wire bytes
+var txDropped = 0;
+var pumpTimer = null;
+var pumpAt = 0;                     // when the lanes' credit was last topped up
 var bytesIn = 0;
 var bytesOut = 0;
 var writeErrors = 0;
@@ -426,6 +481,8 @@ function resetCallState() {
   answerResends = 0;
   haveRemoteDesc = false;
   turnCreds = null;
+  peerTurn = null;
+  laneRate = LANE_RATE;
   gather = null;
   var oldPC = pc;
   var oldConn = callConn;
@@ -434,6 +491,7 @@ function resetCallState() {
   dcOpen = false;
   dcOpenAt = 0;
   callConn = null;
+  closeLanes();
   if (oldPC) { try { oldPC.close(); } catch (e) {} }
   if (oldConn) { try { oldConn.close(); } catch (e) {} }
 }
@@ -481,11 +539,11 @@ function findLocalID(data, wantCreator) {
 
 // ── ICE gathering ──
 
-// gatherCandidates resolves with the candidates found for the current PeerConnection once gathering
-// is over (or, after GATHER_TIMEOUT_MS, with what there is); it fails when there are none, and
-// then the TURN server cannot be reached.
-function gatherCandidates() {
-  var g = gather;
+// gatherCandidates resolves with the candidates found for a PeerConnection (the call's own, unless a
+// lane's gathering record is given) once gathering is over (or, after GATHER_TIMEOUT_MS, with what there
+// is); it fails when there are none, and then the TURN server cannot be reached.
+function gatherCandidates(lane) {
+  var g = lane || gather;
   return new Promise(function (resolve, reject) {
     if (!g) { reject(new Error("no PeerConnection")); return; }
     function finish(timedOut) {
@@ -504,6 +562,49 @@ function gatherCandidates() {
   });
 }
 
+// turnKindOf names how a TURN url is reached: "tcp" for ?transport=tcp and for turns:, else "udp".
+function turnKindOf(url) {
+  url = String(url);
+  return /^turns:/i.test(url) || /[?&]transport=tcp\b/i.test(url) ? "tcp" : "udp";
+}
+
+// turnURLsOf returns the urls reached the wanted way. A call lists UDP urls (and, on some calls, TCP ones
+// as well): when it lists none of the wanted kind, the same servers are tried that way, which a TURN server
+// answers on the port it answers UDP on.
+function turnURLsOf(urls, want) {
+  var out = [];
+  for (var i = 0; i < urls.length; i++) {
+    if (turnKindOf(urls[i]) === want) out.push(urls[i]);
+  }
+  if (!out.length && want === "tcp") {
+    for (var j = 0; j < urls.length; j++) {
+      var u = String(urls[j]).replace(/\?.*$/, "");
+      if (/^turn:/i.test(u)) out.push(u + "?transport=tcp");
+    }
+  }
+  return out.length ? out : urls;
+}
+
+// pcOptions is what every PeerConnection of a call is made with: the relay it allocates on, and what
+// the core does about a path that drops in bursts (see tuneConnection in transport/script).
+function pcOptions(urls, turn) {
+  var direct = role === "receiver" && NODE_DIRECT;
+  var o = {
+    iceServers: direct ? [] : [{ urls: urls, username: turn.username, credential: turn.credential }],
+    sctpMtu: SCTP_MTU,        // one packet of the tunnel is one datagram
+    sctpRtoMaxMs: 3000,       // SCTP's retransmission timer backs off to 60 s by default: the channel is dead meanwhile
+    sctpMinCwnd: 131072,      // the TCP inside has its own congestion control; SCTP's would only slow it a second time
+    paceKBps: 400,            // datagrams leave one by one, not as the dozen SCTP releases on an acknowledgement
+    paceQueue: 48,            // and what waits longer than that is dropped (the signal the TCP inside reacts to)
+    dcBufKB: 96,              // as is what the channel itself holds
+  };
+  // The caller sits behind a whitelist and reaches the TURN servers only. A node with a public address need
+  // not: its own address is its candidate, it sends straight to the caller's relayed address, and the data
+  // crosses one allocation, not two. It allocates nothing then and lends its credentials (lendTurn).
+  if (!direct) o.iceTransportPolicy = "relay";
+  return o;
+}
+
 function createP2PPeerConnection(gen) {
   var turn = turnCreds && turnCreds.turn;
   var urls = turn && turn.urls;
@@ -512,21 +613,12 @@ function createP2PPeerConnection(gen) {
     callFailed(gen, "the call gave no TURN server (" + shape(turnCreds) + ")");
     return false;
   }
-  trace("call #" + callNo + ": " + urls.length + " TURN url(s), first " + String(urls[0]).replace(/\?.*$/, ""));
+  var use = turnURLsOf(urls, TURN_TRANSPORT[role]);
+  trace("call #" + callNo + ": " + urls.length + " TURN url(s) (" + urls.map(turnKindOf).join(", ") + "), using " + use.map(turnKindOf).join(", ") + ", first " + String(use[0]).replace(/\?.*$/, ""));
 
   var g = { cands: [], done: false, waiters: [], settled: false };
   gather = g;
-  var p = webrtc.newPeerConnection({
-    iceServers: [{ urls: urls, username: turn.username, credential: turn.credential }],
-    iceTransportPolicy: "relay",
-    // What the core does about a path that drops in bursts (see tuneConnection in transport/script):
-    sctpMtu: SCTP_MTU,        // one packet of the tunnel is one datagram
-    sctpRtoMaxMs: 3000,       // SCTP's retransmission timer backs off to 60 s by default: the channel is dead meanwhile
-    sctpMinCwnd: 131072,      // the TCP inside has its own congestion control; SCTP's would only slow it a second time
-    paceKBps: 400,            // datagrams leave one by one, not as the dozen SCTP releases on an acknowledgement
-    paceQueue: 48,            // and what waits longer than that is dropped (the signal the TCP inside reacts to)
-    dcBufKB: 96,              // as is what the channel itself holds
-  });
+  var p = webrtc.newPeerConnection(pcOptions(use, turn));
   pc = p;
 
   p.onicecandidate = function (c) {
@@ -572,14 +664,20 @@ function wireDataChannel(gen, d) {
     callFails = 0;
     trace("call #" + callNo + ": data channel open, connected");
     setState("connected");
+    rebuildSendDCs();
+    lendTurn(gen);
+    sendCfg(gen);
+    startLanes(gen);
   };
   d.onclose = function () {
     if (d !== dc || gen !== callGen) return;
     dcOpen = false;
+    rebuildSendDCs();
     callFailed(gen, "data channel closed");
   };
-  d.onmessage = function (bytes) {
+  d.onmessage = function (bytes, isString) {
     if (d !== dc) return;
+    if (isString) { onLaneSignal(gen, bytes); return; }
     bytesIn += bytes.byteLength || 0;
     emit(bytes);
   };
@@ -975,13 +1073,361 @@ function onIncomingCall(payload) {
   });
 }
 
+// ── Lanes (see the constants) ──
+
+// rebuildSendDCs lists the channels that are open, the call's own first.
+function rebuildSendDCs() {
+  var out = [];
+  if (dc && dcOpen) out.push(dc);
+  for (var k = 1; k < lanes.length; k++) {
+    var l = lanes[k];
+    if (l && l.open && l.d) out.push(l.d);
+  }
+  sendDCs = out;
+}
+
+function sendRecord(d, b) {
+  try {
+    d.send(b);
+    bytesOut += b.byteLength || 0;
+  } catch (e) {
+    // The channel is going down: the PeerConnection's own state change says so.
+    writeErrors++;
+    if (writeErrors <= 3) trace("data channel write failed (" + writeErrors + "): " + e);
+  }
+}
+
+function startPump() {
+  if (pumpTimer) return;
+  if (!pumpAt) pumpAt = Date.now();
+  pumpTimer = setInterval(pumpLanes, PUMP_MS);
+}
+
+function stopPump() {
+  if (pumpTimer) { clearInterval(pumpTimer); pumpTimer = null; }
+}
+
+// pumpLanes tops up every lane's credit for the time that has passed and hands the queue's oldest records to
+// the lanes that have credit; a lane may go a record into debt, which the next top-ups pay off.
+function pumpLanes() {
+  var n = sendDCs.length;
+  var now = Date.now();
+  var dt = Math.max(0, now - pumpAt);
+  pumpAt = now;
+  if (!n) { txq = []; txQueued = 0; stopPump(); return; }
+  var add = laneRate * dt / 1000;
+  var cap = laneRate * CREDIT_MS / 1000;
+  for (var i = 0; i < n; i++) {
+    var c = sendDCs[i];
+    c.__credit = Math.min((c.__credit || 0) + add, cap);
+  }
+  var progress = true;
+  while (txq.length && progress) {
+    progress = false;
+    for (var k = 0; k < n && txq.length; k++) {
+      sendRR = (sendRR + 1) % n;
+      var d = sendDCs[sendRR];
+      if (d.__credit > 0) {
+        var rec = txq.shift();
+        txQueued -= rec.cost;
+        d.__credit -= rec.cost;
+        sendRecord(d, rec.b);
+        progress = true;
+      }
+    }
+  }
+  if (!txq.length) stopPump();
+}
+
+function closeLane(l) {
+  if (!l) return;
+  l.closed = true;
+  for (var i = 0; i < l.timers.length; i++) clearTimeout(l.timers[i]);
+  l.timers = [];
+  var p = l.p;
+  l.p = null;
+  l.d = null;
+  l.open = false;
+  if (p) { try { p.close(); } catch (e) {} }
+}
+
+function closeLanes() {
+  for (var i = 0; i < laneTimers.length; i++) clearTimeout(laneTimers[i]);
+  laneTimers = [];
+  laneTries = [];
+  for (var k = 1; k < lanes.length; k++) closeLane(lanes[k]);
+  lanes = [];
+  sendDCs = [];
+  txq = [];
+  txQueued = 0;
+  stopPump();
+}
+
+// laneTurn is whose credentials lane k allocates with: the call's own, or (the client's lanes from LANES_OWN
+// on) the node's, null while they have not come.
+function laneTurn(k) {
+  if (role === "caller" && k >= LANES_OWN) return peerTurn;
+  return turnCreds && turnCreds.turn;
+}
+
+// laneURLs is the relay a lane allocates on: one of the credentials' servers, the lanes spread over them.
+function laneURLs(k, turn) {
+  var urls = turn && turn.urls;
+  if (typeof urls === "string") urls = [urls];
+  if (!urls || !urls.length) return null;
+  var use = turnURLsOf(urls, TURN_TRANSPORT[role]);
+  return [use[k % use.length]];
+}
+
+// newLane makes lane k's PeerConnection; its events are ignored once the lane is closed or replaced.
+function newLane(gen, k) {
+  var turn = laneTurn(k);
+  var urls = laneURLs(k, turn);
+  if (!turn || !urls) return null;
+  var l = {
+    k: k, p: null, d: null, open: false, closed: false, timers: [],
+    g: { cands: [], done: false, waiters: [], settled: false },
+    offerSDP: "", lastOfferSDP: "", answerSDP: "", answerResends: 0, haveRemote: false,
+  };
+  var p = webrtc.newPeerConnection(pcOptions(urls, turn));
+  l.p = p;
+  p.onicecandidate = function (c) {
+    if (p !== l.p) return;
+    if (c && c.candidate) { l.g.cands.push(String(c.candidate)); return; }
+    l.g.done = true;
+    var waiting = l.g.waiters;
+    l.g.waiters = [];
+    for (var i = 0; i < waiting.length; i++) waiting[i]();
+  };
+  p.oniceconnectionstatechange = function (s) {
+    if (p === l.p) trace("lane " + k + ": ice " + s);
+  };
+  p.onconnectionstatechange = function (s) {
+    if (p !== l.p) return;
+    trace("lane " + k + ": peerconnection " + s);
+    if (s === "failed" || s === "closed" || s === "disconnected") laneFailed(gen, l, "peerconnection " + s);
+  };
+  l.timers.push(setTimeout(function () {
+    if (!l.closed && !l.open) laneFailed(gen, l, "no data channel within " + (LANE_CONNECT_DEADLINE_MS / 1000) + "s");
+  }, LANE_CONNECT_DEADLINE_MS));
+  return l;
+}
+
+function wireLaneChannel(gen, l, d) {
+  d.onopen = function () {
+    if (l.closed || d !== l.d || gen !== callGen) return;
+    l.open = true;
+    rebuildSendDCs();
+    trace("lane " + l.k + ": data channel open (" + sendDCs.length + " channel(s) in all)");
+  };
+  d.onclose = function () {
+    if (d !== l.d) return;
+    laneFailed(gen, l, "data channel closed");
+  };
+  d.onmessage = function (bytes) {
+    if (d !== l.d) return;
+    bytesIn += bytes.byteLength || 0;
+    emit(bytes);
+  };
+}
+
+// laneFailed drops a lane. The client opens it again a little later, a few times.
+function laneFailed(gen, l, why) {
+  if (gen !== callGen || l.closed) return;
+  trace("lane " + l.k + " over: " + why);
+  closeLane(l);
+  if (lanes[l.k] === l) lanes[l.k] = null;
+  rebuildSendDCs();
+  if (role === "caller" && dcOpen) scheduleLane(gen, l.k, LANE_RETRY_MS);
+}
+
+// startLanes: the client opens its lanes once the call's own channel is up.
+function startLanes(gen) {
+  if (role !== "caller" || LANES < 2) return;
+  for (var k = 1; k < LANES; k++) scheduleLane(gen, k, LANE_OPEN_GAP_MS * k);
+}
+
+function scheduleLane(gen, k, delay) {
+  laneTries[k] = laneTries[k] || 0;
+  if (laneTries[k] >= LANE_TRIES) { trace("lane " + k + ": given up after " + LANE_TRIES + " tries"); return; }
+  laneTimers.push(setTimeout(function () {
+    if (gen !== callGen || !dcOpen) return;
+    if (k >= LANES_OWN && !peerTurn) {
+      if (Date.now() - dcOpenAt < LANE_PEER_WAIT_MS) { scheduleLane(gen, k, 1000); return; }
+      if (k === LANES_OWN) trace("the node handed no TURN credentials over: lanes " + LANES_OWN + " and up not opened");
+      return;
+    }
+    openLane(gen, k);
+  }, delay));
+}
+
+// openLane (client): a PeerConnection of its own with a data channel, and its offer through the chat.
+function openLane(gen, k) {
+  if (lanes[k]) return;
+  laneTries[k] = (laneTries[k] || 0) + 1;
+  var l = newLane(gen, k);
+  if (!l) return;
+  lanes[k] = l;
+  var p = l.p;
+  l.d = p.createDataChannel("x", { ordered: false, maxRetransmits: 0 });
+  wireLaneChannel(gen, l, l.d);
+  p.createOffer().then(function (offer) {
+    if (l.closed || p !== l.p) throw STALE;
+    return p.setLocalDescription("offer", offer).then(function () {
+      return gatherCandidates(l.g);
+    }).then(function (cands) {
+      if (l.closed || p !== l.p) throw STALE;
+      l.offerSDP = sdputil.withCandidates(offer, cands);
+      trace("lane " + k + ": offer ready, " + cands.length + " candidate(s)");
+      sendLaneOffer(gen, l);
+    });
+  }).catch(function (e) {
+    if (e === STALE || l.closed) return;
+    laneFailed(gen, l, "offer: " + e);
+  });
+}
+
+// sendLaneOffer puts the offer into the chat, and again (as a new message each time) until the answer is in.
+function sendLaneOffer(gen, l) {
+  sendLaneSignal("offer", l.k, l.offerSDP);
+  for (var i = 0; i < LANE_OFFER_RESEND_MS.length; i++) {
+    l.timers.push(setTimeout(function () {
+      if (gen !== callGen || l.closed || l.haveRemote) return;
+      trace("lane " + l.k + ": no answer yet, offering again");
+      sendLaneSignal("offer", l.k, l.offerSDP);
+    }, LANE_OFFER_RESEND_MS[i]));
+  }
+}
+
+// The lanes' descriptions travel inside the call's own data channel, as text (the tunnel's packets are binary),
+// so a dozen lanes do not put two dozen messages into the account's chat.
+function sendLaneSignal(sdpType, k, sdp) {
+  var d = dc;
+  if (!d || !dcOpen) return false;
+  try {
+    d.send(JSON.stringify({ lane: k, type: sdpType, sdp: sdp }));
+    return true;
+  } catch (e) {
+    trace("lane " + k + ": " + sdpType + " not sent: " + e);
+    return false;
+  }
+}
+
+// lendTurn (node): the call's credentials go to the client over the call's own channel. The node is reached
+// directly and needs none, and a user's allocations at a TURN server are limited in number.
+function lendTurn(gen) {
+  if (gen !== callGen || role !== "receiver" || !NODE_DIRECT || !dcOpen) return;
+  var turn = turnCreds && turnCreds.turn;
+  if (!turn || !turn.urls || !turn.username || !turn.credential) return;
+  try {
+    dc.send(JSON.stringify({ type: "turn", turn: { urls: turn.urls, username: turn.username, credential: turn.credential } }));
+    trace("TURN credentials handed to the client");
+  } catch (e) {
+    trace("TURN credentials not sent: " + e);
+  }
+}
+
+// sendCfg (client): what the node deals out per lane is the client's to say, so a change of the number needs
+// no new node.
+function sendCfg(gen) {
+  if (gen !== callGen || role !== "caller" || !dcOpen || !LANE_RATE) return;
+  try {
+    dc.send(JSON.stringify({ type: "cfg", rate: LANE_RATE }));
+  } catch (e) {
+    trace("cfg not sent: " + e);
+  }
+}
+
+function onLaneSignal(gen, bytes) {
+  if (gen !== callGen) return;
+  var m;
+  try { m = JSON.parse(text.decode(bytes)); } catch (e) { trace("a text on the data channel did not parse: " + e); return; }
+  if (m && m.type === "cfg") {
+    var r = Number(m.rate);
+    if (role === "receiver" && r >= 1000 && r <= 30000) {
+      laneRate = r;
+      trace("lane rate " + r + " B/s, as the client says");
+    }
+    return;
+  }
+  if (m && m.type === "turn") {
+    var t = m.turn;
+    if (role === "caller" && t && t.urls && t.username && t.credential) {
+      peerTurn = t;
+      trace("the node handed its TURN credentials over");
+    }
+    return;
+  }
+  var k = Number(m && m.lane) || 0;
+  if (!m || k < 1 || typeof m.sdp !== "string") return;
+  if (role === "receiver" && m.type === "offer") onLaneOffer(m.sdp, k);
+  else if (role === "caller" && m.type === "answer") onLaneAnswer(m.sdp, k);
+  else trace("lane " + k + ": " + m.type + " is not for a " + role + ", ignored");
+}
+
+function onLaneAnswer(sdp, k) {
+  var l = lanes[k];
+  if (!l || l.closed || l.haveRemote || !l.p) { trace("lane " + k + ": an answer with no use, ignored"); return; }
+  var gen = callGen;
+  var p = l.p;
+  l.haveRemote = true;
+  p.setRemoteDescription("answer", sdp).then(function () {
+    trace("lane " + k + ": answer applied");
+  }).catch(function (e) {
+    laneFailed(gen, l, "answer: " + e);
+  });
+}
+
+// onLaneOffer (node): the client's lane k. The offer again (it has not seen the answer) gets the
+// answer again; a different one means the client started the lane over.
+function onLaneOffer(sdp, k) {
+  if (!pc || !turnCreds) { trace("lane " + k + ": offer before the call is up, ignored (the client offers again)"); return; }
+  var gen = callGen;
+  var l = lanes[k];
+  if (l && !l.closed && l.lastOfferSDP === sdp) {
+    if (l.answerSDP && l.answerResends < 3) {
+      l.answerResends++;
+      trace("lane " + k + ": the same offer again, repeating the answer (" + l.answerResends + ")");
+      sendLaneSignal("answer", k, l.answerSDP);
+    }
+    return;
+  }
+  if (l) { closeLane(l); lanes[k] = null; }
+  l = newLane(gen, k);
+  if (!l) return;
+  lanes[k] = l;
+  l.lastOfferSDP = sdp;
+  var p = l.p;
+  p.ondatachannel = function (remote) {
+    if (p !== l.p || l.closed) return;
+    l.d = remote;
+    wireLaneChannel(gen, l, remote);
+  };
+  p.setRemoteDescription("offer", sdp).then(function () {
+    return p.createAnswer();
+  }).then(function (answer) {
+    if (l.closed || p !== l.p) throw STALE;
+    return p.setLocalDescription("answer", answer).then(function () {
+      return gatherCandidates(l.g);
+    }).then(function (cands) {
+      if (l.closed || p !== l.p) throw STALE;
+      l.answerSDP = sdputil.withCandidates(answer, cands);
+      trace("lane " + k + ": answer ready, " + cands.length + " candidate(s)");
+      sendLaneSignal("answer", k, l.answerSDP);
+    });
+  }).catch(function (e) {
+    if (e === STALE || l.closed) return;
+    laneFailed(gen, l, "answer: " + e);
+  });
+}
+
 // ── Status ──
 
 // A line a minute with the state of everything, for working out afterwards what a drop was about.
 function traceStatus() {
   var call = "no call";
   if (pc) {
-    call = "call #" + callNo + (dcOpen ? " up " + Math.round((Date.now() - dcOpenAt) / 1000) + "s, in " + bytesIn + "B out " + bytesOut + "B" : " setting up");
+    call = "call #" + callNo + (dcOpen ? " up " + Math.round((Date.now() - dcOpenAt) / 1000) + "s, " + sendDCs.length + " channel(s), in " + bytesIn + "B out " + bytesOut + "B, queue " + txQueued + "B, dropped " + txDropped : " setting up");
   } else if (callTimer) {
     call = "redial pending (fail #" + callFails + ")";
   }
@@ -1145,7 +1591,7 @@ var Transport = {
   info: function () {
     return {
       name: "oneme-webrtc",
-      version: "3.5.0",
+      version: "3.8.2",
       // What a setup page hands over lands in the cookie jar of this address (cookiesApplied).
       cookieDomain: "https://web.max.ru/",
       mtu: 0,
@@ -1178,7 +1624,7 @@ var Transport = {
     sessionFails = 0;
     callFails = 0;
     seenOps = {};
-    trace("open 3.5.0: " + role + (calleeID ? ", callee " + calleeID : "") + (chatID ? ", chat " + chatID : ", no chat id") + (maxToken ? "" : ", no token"));
+    trace("open 3.8.2: " + role + (calleeID ? ", callee " + calleeID : "") + (chatID ? ", chat " + chatID : ", no chat id") + (maxToken ? "" : ", no token"));
 
     if (!maxToken) {
       if (role === "receiver") {
@@ -1207,15 +1653,28 @@ var Transport = {
   },
 
   write: function (bytes) {
-    if (!dc || !dcOpen) return;
-    try {
-      dc.send(bytes);
-      bytesOut += bytes.byteLength || 0;
-    } catch (e) {
-      // The channel is going down: the PeerConnection's own state change says so.
-      writeErrors++;
-      if (writeErrors <= 3) trace("data channel write failed (" + writeErrors + "): " + e);
+    var n = sendDCs.length;
+    if (!n) return;
+    if (!laneRate) {
+      sendRR = (sendRR + 1) % n;
+      sendRecord(sendDCs[sendRR], bytes);
+      return;
     }
+    var cost = (bytes.byteLength || 0) + WIRE_OVERHEAD;
+    if (cost <= SMALL_RECORD + WIRE_OVERHEAD) {
+      // An ACK does not wait, but the lane it takes is charged for it.
+      var best = sendDCs[0];
+      for (var i = 1; i < n; i++) {
+        if ((sendDCs[i].__credit || 0) > (best.__credit || 0)) best = sendDCs[i];
+      }
+      best.__credit = (best.__credit || 0) - cost;
+      sendRecord(best, bytes);
+      return;
+    }
+    if (txQueued + cost > n * laneRate * QUEUE_MS / 1000) { txDropped++; return; }
+    txq.push({ b: bytes, cost: cost });
+    txQueued += cost;
+    startPump();
   },
 
   close: function () {
